@@ -1,0 +1,40 @@
+🌾 CAMPOS DE RECURSOS (Slots 1-18)
+═══════════════════════════════════════════
+
+   🪵 Slot  1: Leñador              Nivel 3
+   🌾 Slot  2: Granja               Nivel 3
+   🪵 Slot  3: Leñador              Nivel 1
+   ❓ Slot  4: Mina                 Nivel 0
+    ite Slot  5: Barrera              Nivel 1
+    ite Slot  6: Barrera              Nivel 1
+   ❓ Slot  7: Mina                 Nivel 0
+   🌾 Slot  8: Granja               Nivel 0
+   🌾 Slot  9: Granja               Nivel 0
+   ❓ Slot 10: Mina                 Nivel 0
+   ❓ Slot 11: Mina                 Nivel 0
+   🌾 Slot 12: Granja               Nivel 0
+   🌾 Slot 13: Granja               Nivel 0
+   🪵 Slot 14: Leñador              Nivel 0
+   🌾 Slot 15: Granja               Nivel 0
+    ite Slot 16: Barrera              Nivel 0
+   🪵 Slot 17: Leñador              Nivel 1
+    ite Slot 18: Barrera              Nivel 0
+
+═══════════════════════════════════════════
+   🏛️  EDIFICIOS (Slots 19-40)
+═══════════════════════════════════════════
+
+   🔳 Slot 19: [VACÍO - Construir nuevo]
+   🔳 Slot 20: [VACÍO - Construir nuevo]
+   🔳 Slot 21: [VACÍO - Construir nuevo]
+   🔳 Slot 22: [VACÍO - Construir nuevo]
+   🔳 Slot 23: [VACÍO - Construir nuevo]
+   🔳 Slot 24: [VACÍO - Construir nuevo]
+   🔳 Slot 25: [VACÍO - Construir nuevo]
+   🏛️ Slot 26: Edif. principal           Nivel 1
+   🔳 Slot 27: [VACÍO - Construir nuevo]
+   🔳 Slot 28: [VACÍO - Construir nuevo]
+   🔳 Slot 29: [VACÍO - Construir nuevo]
+   🔳 Slot 30: [VACÍO - Construir nuevo]
+   🔳 Slot 31: [VACÍO - Construir nuevo]
+   🔳 Slot 32: [VACÍO - Construir nuevo]
