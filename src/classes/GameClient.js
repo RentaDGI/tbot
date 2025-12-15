@@ -12,11 +12,6 @@ class GameClient {
         this.context = null;
         this.page = null;
         this.isLoggedIn = false;
-        
-        // MEMORIA LOCAL (CACHÉ)
-        // Guardará el estado de los campos para no escanear cada vez
-        this.resourcesCache = null; 
-        this.lastCacheUpdate = 0;
     }
 
     async init() {
@@ -101,10 +96,10 @@ class GameClient {
     }
 
     /**
-     * ESCÁNER INICIAL (Se ejecuta solo una vez al arrancar o cada X horas)
+     * ESCÁNER 1-A-1 BLINDADO ("Todo o Nada")
      */
-    async buildCache() {
-        logger.info('🔄 Creando mapa de recursos en memoria (Solo una vez)...');
+    async scanSlotsOneByOne() {
+        logger.info('🔍 Escaneando campos uno a uno...');
         const fields = [];
         
         for (let slot = 1; slot <= 18; slot++) {
@@ -112,11 +107,25 @@ class GameClient {
                 if (this.page.isClosed()) break;
                 
                 await this.page.goto(`${process.env.GAME_URL}/build.php?id=${slot}`, { waitUntil: 'domcontentloaded' });
-                // Añadimos un poco de aleatoriedad al delay para parecer humano revisando
-                await this.page.waitForTimeout(Math.random() * 500 + 200); 
+                await this.page.waitForTimeout(200); // Pequeña espera
 
+                // 1. Obtener Info
                 const info = await this.getBuildingInfo();
-                const isUnderConstruction = await this.checkConstruction(slot);
+
+                // 2. Detectar Construcción
+                const isUnderConstruction = await this.page.evaluate((currentSlot) => {
+                    const queueBox = document.querySelector('.buildingList, .boxes-contents');
+                    if (!queueBox) return false;
+                    const links = queueBox.querySelectorAll('a');
+                    for (const link of links) {
+                        const href = link.getAttribute('href') || '';
+                        if (href.includes(`id=${currentSlot}`)) {
+                            const match = href.match(/id=(\d+)/);
+                            if (match && parseInt(match[1]) === currentSlot) return true;
+                        }
+                    }
+                    return false;
+                }, slot);
 
                 if (info.name) {
                     const name = info.name.toLowerCase();
@@ -128,98 +137,46 @@ class GameClient {
 
                     if (type) {
                         const effectiveLevel = isUnderConstruction ? info.level + 1 : info.level;
-                        fields.push({ slot, type, level: effectiveLevel, isBusy: isUnderConstruction });
+                        fields.push({ slot, type, level: effectiveLevel });
+                        if (process.env.DEBUG === 'true') {
+                            const status = isUnderConstruction ? '(🔨)' : '';
+                            console.log(`   Slot ${slot}: ${type} ${info.level} ${status}`);
+                        }
                     }
                 }
-            } catch (e) {}
-        }
-        
-        this.resourcesCache = fields;
-        this.lastCacheUpdate = Date.now();
-        logger.success(`✅ Mapa de recursos guardado en memoria (${fields.length} campos).`);
-    }
-
-    /**
-     * Helper para detectar construcción
-     */
-    async checkConstruction(slotId) {
-        return await this.page.evaluate((currentSlot) => {
-            const queueBox = document.querySelector('.buildingList, .boxes-contents');
-            if (!queueBox) return false;
-            const links = queueBox.querySelectorAll('a');
-            for (const link of links) {
-                const href = link.getAttribute('href') || '';
-                if (href.includes(`id=${currentSlot}`)) {
-                    const match = href.match(/id=(\d+)/);
-                    if (match && parseInt(match[1]) === currentSlot) return true;
-                }
+            } catch (e) {
+                logger.warn(`⚠️ Error leyendo slot ${slot}, reintentando...`);
+                // Si falla un slot, no lo añadimos a fields.
             }
-            return false;
-        }, slotId);
+        }
+
+        // === SEGURIDAD "TODO O NADA" ===
+        // Si no hemos leído exactamente 18 campos, el escáner ha fallado parcialmente.
+        // Si devolvemos una lista incompleta, el bot puede pensar que ya terminó tareas que no ha visto.
+        if (fields.length < 18) {
+            logger.error(`⛔ ALERTA: Escáner incompleto (${fields.length}/18). Abortando para evitar errores.`);
+            throw new Error('SCAN_INCOMPLETE_RETRY');
+        }
+
+        return fields;
     }
 
-    /**
-     * LÓGICA OPTIMIZADA: Usa la memoria en vez de navegar
-     */
     async findLowestLevelField(buildingType, maxLevel) {
-        // 1. Si no hay caché, lo creamos (esto pasa 1 vez)
-        if (!this.resourcesCache) {
-            await this.buildCache();
+        // Usamos SIEMPRE el escáner lento.
+        const fields = await this.scanSlotsOneByOne();
+        
+        // Verificación extra de seguridad
+        const typeCount = fields.filter(f => f.type === buildingType).length;
+        if (typeCount === 0) {
+            throw new Error(`SCAN_FAILED: No se encontraron campos de tipo ${buildingType}`);
         }
 
-        // 2. Buscamos en memoria
-        const eligible = this.resourcesCache
-            .filter(f => f.type === buildingType && f.level < maxLevel)
-            .sort((a, b) => a.level - b.level);
-
-        if (eligible.length === 0) {
-            // Si la memoria dice que no hay nada, devolvemos null
-            // (Seguridad: si falla mucho, podríamos forzar un rebuildCache)
-            return null;
-        }
-
-        // 3. Seleccionamos el candidato
-        const candidate = eligible[0];
-
-        // 4. VERIFICACIÓN "JUST IN TIME"
-        // Antes de decir "ve a este", vamos a ir a ese slot específico y actualizar el caché
-        // Esto evita errores si subiste algo manualmente.
+        const eligible = fields.filter(f => f.type === buildingType && f.level < maxLevel)
+                               .sort((a, b) => a.level - b.level);
         
-        // NOTA: Como el TaskRunner va a navegar a ese slot justo después,
-        // devolvemos el candidato y dejamos que el TaskRunner navegue.
-        // Pero necesitamos un mecanismo para actualizar el caché tras la visita.
-        
-        return candidate;
+        return eligible.length > 0 ? eligible[0] : null;
     }
 
-    /**
-     * ACTUALIZAR CACHÉ PUNTUAL
-     * Se llama después de visitar un edificio para construir
-     */
-    async updateCacheForSlot(slotId) {
-        if (!this.resourcesCache) return;
-
-        try {
-            const info = await this.getBuildingInfo();
-            const isUnderConstruction = await this.checkConstruction(slotId);
-            
-            // Buscar en caché y actualizar
-            const index = this.resourcesCache.findIndex(f => f.slot === slotId);
-            if (index !== -1) {
-                const effectiveLevel = isUnderConstruction ? info.level + 1 : info.level;
-                
-                // Actualizamos datos
-                this.resourcesCache[index].level = effectiveLevel;
-                this.resourcesCache[index].isBusy = isUnderConstruction;
-                
-                if (process.env.DEBUG) logger.info(`🧠 Memoria actualizada: Slot ${slotId} ahora es Nivel ${effectiveLevel}`);
-            }
-        } catch(e) {
-            logger.warn('No se pudo actualizar caché puntual');
-        }
-    }
-
-    // ... (Aventuras, Login, Init iguales que antes)
     async checkAndStartAdventure() {
         if (this.page.isClosed()) return false;
         logger.info('🗺️ Revisando aventuras...');

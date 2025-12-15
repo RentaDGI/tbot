@@ -67,7 +67,7 @@ class TaskRunner {
                 let builtSomething = false;
                 let queueIsFull = false;
 
-                // 3. Iterar sobre las tareas (Lógica de Salto Inteligente)
+                // 3. Iterar sobre las tareas
                 logger.info(`📋 Revisando ${tasks.length} tareas pendientes...`);
 
                 for (const task of tasks) {
@@ -81,19 +81,17 @@ class TaskRunner {
 
                     // ANÁLISIS DEL RESULTADO
                     if (result.reason === 'completed_already') {
-                        // La tarea se completó sola (todos los edificios están al nivel)
-                        // Pasamos a la siguiente tarea sin esperar
-                        continue;
+                        continue; // Tarea completada, siguiente
                     }
 
                     if (result.reason === 'queue_full') {
-                        logger.warn('⏳ Cola de construcción llena. Deteniendo revisión.');
+                        logger.warn('⏳ Cola de construcción llena.');
                         queueIsFull = true;
                         break; // No tiene sentido seguir
                     } 
                     
                     if (result.reason === 'not_enough_resources') {
-                        logger.warn(`💰 Faltan recursos para ${task.building_name}. Saltando a siguiente tarea...`);
+                        logger.warn(`💰 Faltan recursos para ${task.building_name}. Saltando...`);
                         continue; // Probamos la siguiente tarea
                     }
 
@@ -102,21 +100,17 @@ class TaskRunner {
                         break;
                     }
 
-                    // Pausa pequeña entre intentos fallidos para no saturar
                     await sleep(2000);
                 }
 
                 // 4. Decidir cuánto dormir
                 if (builtSomething) {
-                    // Descanso aleatorio tras construir (10-15 seg)
                     await sleep(10000 + Math.random() * 5000);
                 } else if (queueIsFull) {
-                    // Si cola llena, esperar 2 minutos
                     logger.info('⏳ Esperando 2 minutos por cola llena...');
                     await sleep(120000);
                 } else {
-                    // Si recorrimos todas y ninguna se pudo hacer (falta de recursos global)
-                    logger.info('💤 Ninguna tarea posible (Falta de recursos global). Esperando 5 min...');
+                    logger.info('💤 Ninguna tarea posible (Falta de recursos). Esperando 5 min...');
                     await sleep(300000);
                 }
 
@@ -149,11 +143,9 @@ class TaskRunner {
             
             // Selección inteligente de slot (recursos)
             if (task.building_type) {
-                // Esto busca en la memoria caché (rápido)
                 const field = await this.client.findLowestLevelField(task.building_type, task.target_level);
                 
                 if (!field) {
-                    // Si devuelve null, es que ya todos cumplen el nivel
                     logger.success(`✅ Todos los '${task.building_type}' están al nivel ${task.target_level}. Tarea completada.`);
                     await this.completeTask(task.id);
                     return { success: false, reason: 'completed_already' }; 
@@ -168,24 +160,13 @@ class TaskRunner {
             // Navegar
             await this.client.clickBuildingSlot(slot);
 
-            // ACTUALIZACIÓN DE MEMORIA "JUST IN TIME"
-            // Visitamos el slot, miramos la realidad y actualizamos la memoria del bot
-            if (task.building_type) {
-                await this.client.updateCacheForSlot(slot);
-            }
-
             // Intentar construir
             const result = await this.client.upgradeBuild();
 
             if (result.success) {
                 logger.success(`🏗️ Construcción iniciada: ${task.building_name}`);
                 
-                // Si hubo éxito, actualizamos la memoria de nuevo para marcarlo como "En construcción" (+1 nivel)
-                if (task.building_type) {
-                    await this.client.updateCacheForSlot(slot);
-                }
-
-                // Si es un edificio único (no recurso), marcamos tarea como completada
+                // Si es un edificio único, marcamos completado
                 if (!task.building_type) {
                     await this.completeTask(task.id);
                 }
@@ -196,11 +177,7 @@ class TaskRunner {
 
         } catch (error) {
             if (this.isClosedError(error)) return { success: false, reason: 'browser_closed' };
-            
-            // Si el error es de escáner
-            if (error.message.includes('SCAN')) {
-                return { success: false, reason: 'scan_error' };
-            }
+            if (error.message.includes('SCAN')) return { success: false, reason: 'scan_error' };
 
             logger.error('Error en handleBuild', { error: error.message });
             return { success: false, reason: 'error' };
