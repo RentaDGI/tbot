@@ -67,9 +67,8 @@ class TaskRunner {
                     continue;
                 }
 
-                if (Math.random() > 0.7) {
-                    await this.client.checkAndStartAdventure();
-                }
+                // Revisa aventuras en cada ciclo (sin filtrar por salud)
+                await this.client.checkAndStartAdventure();
 
                 if (this.cycleCount % 50 === 0) {
                     logger.info('Re-escaneo periodico...');
@@ -231,10 +230,41 @@ class TaskRunner {
     async handleBuildWithCache(tasks, resourceAmounts = {}) {
         try {
             await this.client.scanFieldsIfNeeded();
+            const nonResourceTasks = tasks.filter(t => !t.building_type);
             const lowestField = this.client.findLowestFieldAcrossAllTasks(tasks, resourceAmounts);
 
+            const tryNonResource = async () => {
+                if (!nonResourceTasks.length) return { success: false, reason: 'no_nonresource_tasks' };
+                for (const nonResource of nonResourceTasks) {
+                    try {
+                        const targetSlot = nonResource.building_slot || null;
+                        if (targetSlot) {
+                            await this.client.clickBuildingSlot(targetSlot);
+                        } else if (nonResource.building_name) {
+                            const slot = await this.client.findBuildingSlot(nonResource.building_name);
+                            if (slot) await this.client.clickBuildingSlot(slot);
+                        }
+                        const upgradeResult = await this.client.upgradeBuild();
+                        if (upgradeResult.success) {
+                            logger.success('Construccion (edificio): ' + (nonResource.building_name || nonResource.id || 'desconocido'));
+                            if (nonResource.id) await this.completeBuildTask(nonResource.id);
+                            return { success: true };
+                        }
+                        logger.info('No se pudo mejorar edificio (motivo: ' + upgradeResult.reason + ').');
+                        // si falla por recursos o cola, sigue probando siguiente edificio
+                        if (upgradeResult.reason !== 'not_enough_resources' && upgradeResult.reason !== 'queue_full') {
+                            return { success: false, reason: upgradeResult.reason };
+                        }
+                    } catch (e) {
+                        logger.warn('No se pudo ejecutar tarea de edificio: ' + e.message);
+                        return { success: false, reason: 'building_task_failed' };
+                    }
+                }
+                return { success: false, reason: 'nonresource_all_failed' };
+            };
+
             if (!lowestField) {
-                return { success: false, reason: 'no_eligible_fields' };
+                return await tryNonResource();
             }
 
             await this.client.clickBuildingSlot(lowestField.slot);
@@ -245,7 +275,13 @@ class TaskRunner {
                 this.client.updateFieldLevel(lowestField.slot, true);
                 return { success: true };
             }
-            
+
+            // Loguea la razón y deja continuar con otras tareas
+            logger.info('No se pudo mejorar recurso (motivo: ' + upgradeResult.reason + ').');
+            if (upgradeResult.reason === 'not_enough_resources' || upgradeResult.reason === 'queue_full') {
+                const fallback = await tryNonResource();
+                if (fallback.success) return fallback;
+            }
             return { success: false, reason: upgradeResult.reason };
         } catch (error) {
             if (this.isClosedError(error)) return { success: false, reason: 'browser_closed' };

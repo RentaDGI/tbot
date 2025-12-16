@@ -705,6 +705,8 @@ class GameClient {
                 if (classes.includes('gold')) continue;
                 if (blacklist.some(word => text.includes(word))) continue;
                 if (text.includes('npc') || text.includes('intercambiar')) continue;
+                // Evitar diálogos de protección/plus
+                if (text.includes('prolong') || text.includes('proteger') || text.includes('protecc')) continue;
 
                 const isUpgradeKeyword = upgradeKeywords.some(k => text.includes(k));
                 const isUpgradeClass = ['build', 'upgrade', 'contract'].some(k => classes.includes(k));
