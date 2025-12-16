@@ -1,14 +1,16 @@
 {
   "name": "travian-bot",
   "version": "1.0.0",
-  "description": "Bot de construcción automática",
+  "description": "Bot de construcción y entrenamiento automático para Travian",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
     "add": "node src/scripts/addTask.js",
     "add-task": "node src/scripts/addBuildTask.js",
+    "add-training": "node src/scripts/addTraining.js",
     "scan": "node src/scripts/scanVillage.js",
-    "test-connection": "node src/scripts/testConnection.js"
+    "test-connection": "node src/scripts/testConnection.js",
+    "status": "node src/scripts/status.js"
   },
   "keywords": [],
   "author": "",

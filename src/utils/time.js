@@ -32,6 +32,13 @@ async function sleep(ms) {
 }
 
 /**
+ * Genera un número aleatorio dentro de un rango
+ */
+function randomInterval(min, max) {
+    return Math.round(Math.random() * (max - min) + min);
+}
+
+/**
  * Verifica si es hora de dormir (modo noche)
  */
 function isNightMode() {
@@ -48,5 +55,6 @@ module.exports = {
     gaussianRandom,
     humanDelay,
     sleep,
+    randomInterval,
     isNightMode
 };
