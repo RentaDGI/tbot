@@ -845,6 +845,14 @@ class GameClient {
 
         await humanDelay(this.page, 2000, 3200);
 
+        // Recargar la página para leer la cola actualizada
+        try {
+            await this.page.goto(`${process.env.GAME_URL}/build.php?id=${slot}`, { waitUntil: 'domcontentloaded' });
+            await humanDelay(this.page, 900, 1400);
+        } catch (navErr) {
+            logger.warn('No se pudo recargar pagina de entrenamiento para verificar cola: ' + navErr.message);
+        }
+
         const verify = await this.page.evaluate(({ identifier }) => {
             const normalize = (text) => (text || '')
                 .toLowerCase()
@@ -861,17 +869,59 @@ class GameClient {
                 return { ok: false, reason: 'page_error', message: normalize(errorEl.innerText) };
             }
 
-            const containers = Array.from(document.querySelectorAll('.under_progress, .under-progress, .productionWrapper, .trainUnits, .unitWrapper, .textList, .buildDetails, .details, .queue, .trainingQueue, .build_queue, .boxes-contents, .buildingList, .contract, body'));
+            const queueSelectors = [
+                '.under_progress', '.under-progress', '.trainingQueue', '.productionQueue',
+                '.queue', '.underConstruction', '.build_queue', '.buildingList .under_progress',
+                '.boxes-contents .under_progress', '.boxes-contents .under-progress',
+                '.productionWrapper .under_progress', '.productionWrapper .under-progress'
+            ];
 
-            for (const node of containers) {
+            const queueEntries = Array.from(document.querySelectorAll(queueSelectors.join(',')))
+                // Evitar el formulario principal de entrenamiento (contiene inputs numéricos)
+                .filter(node => !node.querySelector('input[type=\"number\"], input[name^=\"t\"], input[name*=\"t\"]'));
+
+            const matchesEntry = (node) => {
                 const text = normalize(node.innerText || '');
-                if (!text) continue;
+                const hasTimer = /\d{1,2}:\d{2}/.test(text) || text.includes('curso') || text.includes('cola') || text.includes('queue');
+
+                // Revisar imágenes con alt/title
+                const imgs = Array.from(node.querySelectorAll('img'));
+                const imgMatch = targetName && imgs.some(img => {
+                    const alt = normalize(img.getAttribute('alt') || '');
+                    const title = normalize(img.getAttribute('title') || '');
+                    return alt.includes(targetName) || title.includes(targetName);
+                });
 
                 if (targetName) {
-                    if (text.includes(targetName)) return { ok: true };
-                } else {
-                    const anyMatch = text.match(/(\d+)\s*x?/);
-                    if (anyMatch) return { ok: true };
+                    if (hasTimer && text.includes(targetName)) return true;
+                    if (hasTimer && imgMatch) return true;
+                } else if (hasTimer && /\d+\s*x/.test(text)) {
+                    return true;
+                }
+
+                return false;
+            };
+
+            if (queueEntries.some(matchesEntry)) return { ok: true };
+
+            // Fallback: buscar timers y nombre de tropa en bloques con temporizador
+            const timers = Array.from(document.querySelectorAll('.timer, .dur, .countdown'));
+            for (const timer of timers) {
+                const container = timer.closest('li, tr, .textList, .buildDetails, .details, .queue, .under_progress, .under-progress') || timer.parentElement;
+                const text = normalize((container && container.innerText) || '');
+                if (!text) continue;
+
+                const imgs = container ? Array.from(container.querySelectorAll('img')) : [];
+                const imgMatch = targetName && imgs.some(img => {
+                    const alt = normalize(img.getAttribute('alt') || '');
+                    const title = normalize(img.getAttribute('title') || '');
+                    return alt.includes(targetName) || title.includes(targetName);
+                });
+
+                if (targetName) {
+                    if (text.includes(targetName) || imgMatch) return { ok: true };
+                } else if (/\d+\s*x/.test(text)) {
+                    return { ok: true };
                 }
             }
 

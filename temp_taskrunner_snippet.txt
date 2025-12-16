@@ -1,0 +1,140 @@
+                        if (trainingResult.reason === 'not_enough_resources') {
+                            logger.info('Sin recursos para entrenar. Saltando...');
+                            continue;
+                        }
+                        
+                        if (trainingResult.reason === 'building_not_found') {
+                            logger.warn('Edificio no encontrado: ' + task.building_type);
+                            continue;
+                        }
+                    }
+                }
+
+                if (buildResult.success || trainingResult.success) {
+                    await this.humanPause('Acción ejecutada', 9000, 15000);
+                } else if (buildResult.reason === 'queue_full') {
+                    await this.humanPause('Cola de construcción llena', 120000, 160000);
+                } else if (buildResult.reason === 'not_enough_resources' &&
+                           trainingResult.reason === 'not_enough_resources') {
+                    await this.humanPause('Sin recursos suficientes', 150000, 230000);
+                } else {
+                    await this.humanPause('Revisando tareas en breve', 30000, 70000);
+                }
+
+            } catch (error) {
+                if (this.isClosedError(error)) {
+                    this.isRunning = false;
+                    break;
+                }
+                
+                if (error.message.includes('SCAN_INCOMPLETE')) {
+                    logger.warn('Escaneo incompleto. Reintentando...');
+                    this.client.invalidateCache();
+                    await sleep(30000);
+                    continue;
+                }
+
+                logger.error('Error en loop', { error: error.message });
+                await sleep(10000);
+            }
+        }
+    }
+
+    async maybeRaidOases() {
+        const now = Date.now();
+        if (now - this.lastOasisRaid < OASIS_RAID_INTERVAL_MS) return;
+        this.lastOasisRaid = now;
+
+        logger.info('Revisando oasis objetivo para enviar héroe...');
+        try {
+            const sent = await this.client.checkAndRaidOases(OASIS_RAID_TARGETS);
+            if (sent) {
+                logger.success('Héroe despachado a uno de los oasis programados.');
+            } else {
+                logger.info('Ningún oasis necesitaba ataque en esta tanda.');
+            }
+        } catch (error) {
+            logger.warn('Error en el chequeo de oasis: ' + error.message);
+        }
+    }
+
+    async humanPause(reason, minMs, maxMs) {
+        const delay = randomInterval(minMs, maxMs);
+        logger.info(`${reason}. Esperando ${(delay / 1000).toFixed(1)}s...`);
+        await sleep(delay);
+    }
+
+    async reorderResourceTasks(tasks) {
+        if (!tasks || tasks.length === 0) return { sortedTasks: [], resourceAmounts: null };
+
+        const resourceTasks = [];
+        const otherTasks = [];
+
+        for (const task of tasks) {
+            if (task.building_type) resourceTasks.push(task);
+            else otherTasks.push(task);
+        }
+
+        let resourceAmounts = null;
+        try {
+            resourceAmounts = await this.client.getResourceAmounts();
+        } catch (error) {
+            logger.warn('No se pudieron leer los recursos actuales: ' + error.message);
+        }
+
+        const resourceMap = resourceAmounts || {};
+
+        resourceTasks.sort((a, b) => {
+            const aVal = resourceMap[a.building_type] ?? Number.MAX_SAFE_INTEGER;
+            const bVal = resourceMap[b.building_type] ?? Number.MAX_SAFE_INTEGER;
+            if (aVal !== bVal) return aVal - bVal;
+            return (b.priority || 0) - (a.priority || 0);
+        });
+
+        return { sortedTasks: [...resourceTasks, ...otherTasks], resourceAmounts: resourceMap };
+    }
+
+    async getPendingBuildTasks() {
+        const { data } = await this.supabase
+            .from('build_queue')
+            .select('*')
+            .eq('account_id', this.account.id)
+            .eq('status', 'pending')
+            .order('priority', { ascending: false })
+            .order('created_at', { ascending: true })
+            .limit(20);
+        
+        return data || [];
+    }
+
+    async handleBuildWithCache(tasks, resourceAmounts = {}) {
+        try {
+            await this.client.scanFieldsIfNeeded();
+            const nonResourceTasks = tasks.filter(t => !t.building_type);
+            const lowestField = this.client.findLowestFieldAcrossAllTasks(tasks, resourceAmounts);
+
+            const tryNonResource = async () => {
+                if (!nonResourceTasks.length) return { success: false, reason: 'no_nonresource_tasks' };
+                let completedAny = false;
+
+                for (const nonResource of nonResourceTasks) {
+                    try {
+                        const targetSlot = nonResource.building_slot || null;
+                        const targetLevel = typeof nonResource.target_level === 'number'
+                            ? nonResource.target_level
+                            : null;
+                        let currentLevel = null;
+
+                        if (targetSlot) {
+                            await this.client.clickBuildingSlot(targetSlot);
+                        } else if (nonResource.building_name) {
+                            const slot = await this.client.findBuildingSlot(nonResource.building_name);
+                            if (slot) await this.client.clickBuildingSlot(slot);
+                        }
+
+                        try {
+                            const info = await this.client.getBuildingInfo();
+                            if (info && typeof info.level === 'number') currentLevel = info.level;
+                        } catch (infoErr) {
+                            logger.warn('No se pudo leer el nivel actual del edificio: ' + infoErr.message);
+                        }

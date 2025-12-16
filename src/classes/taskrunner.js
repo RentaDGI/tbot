@@ -235,19 +235,59 @@ class TaskRunner {
 
             const tryNonResource = async () => {
                 if (!nonResourceTasks.length) return { success: false, reason: 'no_nonresource_tasks' };
+                let completedAny = false;
+
                 for (const nonResource of nonResourceTasks) {
                     try {
                         const targetSlot = nonResource.building_slot || null;
+                        const targetLevel = typeof nonResource.target_level === 'number'
+                            ? nonResource.target_level
+                            : null;
+                        let currentLevel = null;
+
                         if (targetSlot) {
                             await this.client.clickBuildingSlot(targetSlot);
                         } else if (nonResource.building_name) {
                             const slot = await this.client.findBuildingSlot(nonResource.building_name);
                             if (slot) await this.client.clickBuildingSlot(slot);
                         }
+
+                        try {
+                            const info = await this.client.getBuildingInfo();
+                            if (info && typeof info.level === 'number') currentLevel = info.level;
+                        } catch (infoErr) {
+                            logger.warn('No se pudo leer el nivel actual del edificio: ' + infoErr.message);
+                        }
+
+                        if (targetLevel !== null &&
+                            currentLevel !== null &&
+                            currentLevel >= targetLevel) {
+                            logger.success('Construccion ya al nivel objetivo: ' + (nonResource.building_name || nonResource.id || 'desconocido') + ' (Nivel ' + currentLevel + ')');
+                            if (nonResource.id) await this.completeBuildTask(nonResource.id);
+                            completedAny = true;
+                            continue;
+                        }
+
                         const upgradeResult = await this.client.upgradeBuild();
                         if (upgradeResult.success) {
+                            const nextLevel = currentLevel !== null ? currentLevel + 1 : null;
+                            const willReachTarget = targetLevel !== null &&
+                                nextLevel !== null &&
+                                nextLevel >= targetLevel;
+
                             logger.success('Construccion (edificio): ' + (nonResource.building_name || nonResource.id || 'desconocido'));
-                            if (nonResource.id) await this.completeBuildTask(nonResource.id);
+
+                            if (willReachTarget && nonResource.id) {
+                                await this.completeBuildTask(nonResource.id);
+                                logger.info('Tarea marcada como completada (nivel objetivo alcanzado o en cola).');
+                            } else if (targetLevel === null && nonResource.id) {
+                                // Sin objetivo definido, se mantiene el comportamiento anterior: completar tras un click exitoso.
+                                await this.completeBuildTask(nonResource.id);
+                            } else if (targetLevel !== null && currentLevel !== null) {
+                                const remaining = Math.max(0, targetLevel - nextLevel);
+                                logger.info('Construccion en progreso. Quedan ' + remaining + ' nivel(es) para el objetivo.');
+                            }
+
                             return { success: true };
                         }
                         logger.info('No se pudo mejorar edificio (motivo: ' + upgradeResult.reason + ').');
@@ -260,6 +300,11 @@ class TaskRunner {
                         return { success: false, reason: 'building_task_failed' };
                     }
                 }
+
+                if (completedAny) {
+                    return { success: true, reason: 'some_completed' };
+                }
+
                 return { success: false, reason: 'nonresource_all_failed' };
             };
 
