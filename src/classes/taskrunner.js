@@ -59,7 +59,7 @@ class TaskRunner {
         while (this.isRunning) {
             try {
                 this.cycleCount++;
-                await this.maybeRaidOases();
+                // Se desactiva el envío de héroe a oasis; solo aventuras.
                 
                 if (isNightMode()) {
                     logger.info('Modo nocturno. Esperando...');
@@ -355,6 +355,7 @@ class TaskRunner {
                 return { success: true, trained: result.trained };
             }
 
+            logger.warn('Entrenamiento no ejecutado', { reason: result.reason || 'unknown' });
             return result;
 
         } catch (error) {

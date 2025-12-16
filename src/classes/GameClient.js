@@ -6,10 +6,16 @@ const logger = require('../utils/logger');
 
 const SESSION_PATH = path.resolve(__dirname, '../../session.json');
 const BUILDING_KEYWORDS = {
-    barracks: ['cuartel', 'barracks'],
-    stable: ['establo', 'stable'],
-    workshop: ['taller', 'workshop'],
+    barracks: ['cuartel', 'cuarteles', 'barracks'],
+    stable: ['establo', 'estable', 'stable'],
+    workshop: ['taller', 'taller de asedio', 'workshop'],
     residence: ['residencia', 'palacio', 'residence', 'palace']
+};
+const BUILDING_GIDS = {
+    barracks: [19],
+    stable: [20],
+    workshop: [21],
+    residence: [25, 26]
 };
 
 class GameClient {
@@ -104,9 +110,10 @@ class GameClient {
         await humanDelay(this.page, 1500, 2500);
     }
 
-    async findBuildingSlot(buildingType, explicitSlot) {
+        async findBuildingSlot(buildingType, explicitSlot) {
         if (explicitSlot) return explicitSlot;
         const keywords = (BUILDING_KEYWORDS[buildingType] || [buildingType]).filter(Boolean);
+        const gids = BUILDING_GIDS[buildingType] || [];
         if (!keywords.length) return null;
 
         const tryReadSlotFromPage = async () => {
@@ -118,7 +125,7 @@ class GameClient {
                 return null;
             }
 
-            return await this.page.evaluate(({ keywords }) => {
+            return await this.page.evaluate(({ keywords, gids }) => {
                 const normalize = (text) => (text || '')
                     .toLowerCase()
                     .normalize('NFD')
@@ -126,43 +133,70 @@ class GameClient {
                     .trim();
 
                 const targets = keywords.map(normalize);
+                const gidTargets = gids.map(g => parseInt(g, 10));
 
-                const nodes = Array.from(document.querySelectorAll('area[href*="build.php?id="], a[href*="build.php?id="], [href*="build.php?id="]'));
-                for (const el of nodes) {
-                    const href = el.getAttribute('href') || '';
+                const extractSlotFromEl = (el) => {
+                    if (!el) return null;
+                    const href = el.getAttribute('href') || el.getAttribute('data-href') || '';
+                    const dataId = el.getAttribute('data-id') || el.getAttribute('data-slotid');
                     const match = href.match(/id=(\d+)/);
-                    if (!match) continue;
+                    if (match) return parseInt(match[1], 10);
+                    if (dataId && !isNaN(parseInt(dataId, 10))) return parseInt(dataId, 10);
+                    return null;
+                };
+
+                const candidates = Array.from(document.querySelectorAll('area[href*="build.php?id="], a[href*="build.php?id="], [href*="build.php?id="], [data-slotid], [data-id]'));
+                for (const el of candidates) {
+                    const slotId = extractSlotFromEl(el);
+                    if (!slotId) continue;
+
                     const label = normalize(el.getAttribute('title') || el.getAttribute('alt') || el.textContent || '');
-                    if (targets.some(key => label.includes(key))) {
-                        return parseInt(match[1], 10);
+                    const classText = normalize(el.className || '');
+                    const href = el.getAttribute('href') || '';
+                    const gidMatch = href.match(/gid=(\d+)/);
+                    const gid = gidMatch ? parseInt(gidMatch[1], 10) : null;
+
+                    const byKeyword = targets.some(key => label.includes(key));
+                    const byGid = gid !== null && gidTargets.includes(gid);
+                    const classGid = gidTargets.some(g => classText.includes(`g${g}`));
+
+                    if (byKeyword || byGid || classGid) {
+                        return slotId;
+                    }
+                }
+
+                for (const gid of gidTargets) {
+                    const el = document.querySelector(`.g${gid}, [class*="g${gid}"]`);
+                    if (el) {
+                        const slotId = extractSlotFromEl(el) ||
+                            extractSlotFromEl(el.querySelector('a[href*="build.php?id="]'));
+                        if (slotId) return slotId;
                     }
                 }
 
                 const labels = Array.from(document.querySelectorAll('.buildingSlot, .label'));
                 for (const el of labels) {
                     const link = el.querySelector('a[href*="build.php?id="]');
-                    if (!link) continue;
-                    const href = link.getAttribute('href') || '';
-                    const match = href.match(/id=(\d+)/);
-                    if (!match) continue;
+                    const slotId = extractSlotFromEl(link);
+                    if (!slotId) continue;
                     const label = normalize(el.textContent || link.getAttribute('title') || '');
-                    if (targets.some(key => label.includes(key))) {
-                        return parseInt(match[1], 10);
-                    }
+                    if (targets.some(key => label.includes(key))) return slotId;
                 }
 
                 return null;
-            }, { keywords });
+            }, { keywords, gids });
         };
 
         let slot = await tryReadSlotFromPage();
-        if (slot) return slot;
+        if (slot) {
+            logger.info(`Edificio "${buildingType}" localizado en slot ${slot}.`);
+            return slot;
+        }
 
-        // Fallback: probar slots tÃ­picos de cada edificio
         const fallbackSlots = {
-            barracks: [19],
-            stable: [20],
-            workshop: [21, 22],
+            barracks: [19, 18, 17, 16],
+            stable: [20, 21],
+            workshop: [21, 22, 23],
             residence: [25, 26]
         };
 
@@ -181,84 +215,87 @@ class GameClient {
                     const text = titleEl ? normalize(titleEl.textContent) : '';
                     return keywords.some(key => text.includes(normalize(key)));
                 }, { keywords });
-                if (matches) return candidate;
+                if (matches) {
+                    logger.info(`Edificio "${buildingType}" encontrado por fallback en slot ${candidate}.`);
+                    return candidate;
+                }
             } catch (error) {
                 logger.warn(`No se pudo probar slot ${candidate}: ${error.message}`);
             }
         }
 
+        logger.warn(`No se pudo localizar edificio "${buildingType}". Keywords: ${keywords.join(', ')}; gids: ${gids.join(', ')}`);
         return null;
     }
 
-    /**
-     * ESCÃNER 1-A-1 BLINDADO ("Todo o Nada")
+/**
+     * ESCANER 1-A-1 BLINDADO ("Todo o Nada")
      */
-    async scanSlotsOneByOne() {
-        logger.info('ðŸ” Escaneando campos uno a uno...');
-        const fields = [];
-        
-        for (let slot = 1; slot <= 18; slot++) {
-            try {
-                if (this.page.isClosed()) break;
-                
-                await this.page.goto(`${process.env.GAME_URL}/build.php?id=${slot}`, { waitUntil: 'domcontentloaded' });
-                await this.page.waitForTimeout(200); // PequeÃ±a espera
+    async scanSlotsOneByOne(maxRetries = 3) {
+        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+            logger.info(`Escaneando campos uno a uno... (intento ${attempt}/${maxRetries})`);
+            const fields = [];
 
-                // 1. Obtener Info
-                const info = await this.getBuildingInfo();
+            for (let slot = 1; slot <= 18; slot++) {
+                try {
+                    if (this.page.isClosed()) break;
 
-                // 2. Detectar ConstrucciÃ³n
-                const isUnderConstruction = await this.page.evaluate((currentSlot) => {
-                    const queueBox = document.querySelector('.buildingList, .boxes-contents');
-                    if (!queueBox) return false;
-                    const links = queueBox.querySelectorAll('a');
-                    for (const link of links) {
-                        const href = link.getAttribute('href') || '';
-                        if (href.includes(`id=${currentSlot}`)) {
-                            const match = href.match(/id=(\d+)/);
-                            if (match && parseInt(match[1]) === currentSlot) return true;
+                    await this.page.goto(`${process.env.GAME_URL}/build.php?id=${slot}`, { waitUntil: 'domcontentloaded' });
+                    await this.page.waitForTimeout(300);
+
+                    const info = await this.getBuildingInfo();
+                    const isUnderConstruction = await this.page.evaluate((currentSlot) => {
+                        const queueBox = document.querySelector('.buildingList, .boxes-contents');
+                        if (!queueBox) return false;
+                        const links = queueBox.querySelectorAll('a');
+                        for (const link of links) {
+                            const href = link.getAttribute('href') || '';
+                            if (href.includes(`id=${currentSlot}`)) {
+                                const match = href.match(/id=(\d+)/);
+                                if (match && parseInt(match[1]) === currentSlot) return true;
+                            }
+                        }
+                        return false;
+                    }, slot);
+
+                    if (info.name) {
+                        const name = info.name.toLowerCase();
+                        let type = null;
+                        if (name.includes('le\u00f1a') || name.includes('wood') || name.includes('bosque')) type = 'wood';
+                        else if (name.includes('barr') || name.includes('clay') || name.includes('arcilla')) type = 'clay';
+                        else if (name.includes('hierro') || name.includes('iron') || name.includes('mina')) type = 'iron';
+                        else if (name.includes('granja') || name.includes('crop') || name.includes('cereal')) type = 'crop';
+
+                        if (type) {
+                            const effectiveLevel = isUnderConstruction ? info.level + 1 : info.level;
+                            fields.push({ slot, type, level: effectiveLevel });
+                            if (process.env.DEBUG === 'true') {
+                                const status = isUnderConstruction ? '(build_queue)' : '';
+                                console.log(`   Slot ${slot}: ${type} ${info.level} ${status}`);
+                            }
                         }
                     }
-                    return false;
-                }, slot);
-
-                if (info.name) {
-                    const name = info.name.toLowerCase();
-                    let type = null;
-                    if (name.includes('leÃ±a') || name.includes('wood') || name.includes('bosque')) type = 'wood';
-                    else if (name.includes('barr') || name.includes('clay') || name.includes('arcilla')) type = 'clay';
-                    else if (name.includes('hierro') || name.includes('iron') || name.includes('mina')) type = 'iron';
-                    else if (name.includes('granja') || name.includes('crop') || name.includes('cereal')) type = 'crop';
-
-                    if (type) {
-                        const effectiveLevel = isUnderConstruction ? info.level + 1 : info.level;
-                        fields.push({ slot, type, level: effectiveLevel });
-                        if (process.env.DEBUG === 'true') {
-                            const status = isUnderConstruction ? '(ðŸ”¨)' : '';
-                            console.log(`   Slot ${slot}: ${type} ${info.level} ${status}`);
-                        }
-                    }
+                } catch (e) {
+                    logger.warn(`Error leyendo slot ${slot}, reintentando...`);
                 }
-            } catch (e) {
-                logger.warn(`âš ï¸ Error leyendo slot ${slot}, reintentando...`);
-                // Si falla un slot, no lo aÃ±adimos a fields.
+            }
+
+            if (fields.length === 18) {
+                this.fieldCache = fields;
+                this.lastScanTime = Date.now();
+                this.logCacheStatus();
+                return fields;
+            }
+
+            logger.error(`ALERTA: Escaner incompleto (${fields.length}/18).`);
+            if (attempt < maxRetries) {
+                logger.warn('Reintentando escaneo completo en 3s...');
+                await sleep(3000);
+            } else {
+                throw new Error('SCAN_INCOMPLETE_RETRY');
             }
         }
-
-        // === SEGURIDAD "TODO O NADA" ===
-        // Si no hemos leÃ­do exactamente 18 campos, el escÃ¡ner ha fallado parcialmente.
-        // Si devolvemos una lista incompleta, el bot puede pensar que ya terminÃ³ tareas que no ha visto.
-        if (fields.length < 18) {
-            logger.error(`â›” ALERTA: EscÃ¡ner incompleto (${fields.length}/18). Abortando para evitar errores.`);
-            throw new Error('SCAN_INCOMPLETE_RETRY');
-        }
-
-        this.fieldCache = fields;
-        this.lastScanTime = Date.now();
-        this.logCacheStatus();
-        return fields;
     }
-
     async scanFieldsIfNeeded(forceRescan = false) {
         const cacheValid = this.fieldCache && this.lastScanTime && (Date.now() - this.lastScanTime < this.CACHE_DURATION);
         if (cacheValid && !forceRescan) {
@@ -380,10 +417,7 @@ class GameClient {
             await humanDelay(this.page, 2000, 3000);
 
             const health = await this.getHeroHealthPercent({ skipNavigation: true });
-            if (health < 30) {
-                logger.warn(`ðŸš‘ Salud baja (${health}%). Cancelando.`);
-                return false;
-            }
+            logger.info(`Salud del heroe: ${health}%. No se bloquea por salud.`);
 
             const result = await this.page.evaluate(() => {
                 const buttons = Array.from(document.querySelectorAll('button.green, .adventureList button'));
@@ -412,37 +446,7 @@ class GameClient {
     }
 
     async checkAndRaidOases(oasisTargets, options = {}) {
-        if (this.page.isClosed()) return false;
-
-        try {
-            const health = await this.getHeroHealthPercent();
-            logger.info(`Salud actual del heroe: ${health}%. No se aplicara filtro de salud.`);
-
-            const targets = [...oasisTargets];
-            targets.sort(() => Math.random() - 0.5);
-
-            for (const oasis of targets) {
-                const troops = await this.inspectOasisNatureTroops(oasis);
-                if (troops === null) {
-                    logger.warn(`No se pudo leer las tropas de la naturaleza para el oasis (${oasis.x}|${oasis.y}).`);
-                    continue;
-                }
-
-                logger.info(`Oasis (${oasis.x}|${oasis.y}) - Tropas de la naturaleza: ${troops}`);
-                if (troops >= 1 && troops < 20) {
-                    const sendResult = await this.sendHeroFromCurrentOasis();
-                    if (sendResult.success) {
-                        logger.success(`Heroe enviado al oasis (${oasis.x}|${oasis.y}) con ${troops} tropas.`);
-                        return true;
-                    } else {
-                        logger.warn(`No se pudo enviar el heroe al oasis (${oasis.x}|${oasis.y}): ${sendResult.reason}`);
-                    }
-                }
-            }
-        } catch (error) {
-            logger.warn('Error al revisar oasis: ' + error.message);
-        }
-
+        logger.info('Envio de heroe a oasis desactivado.');
         return false;
     }
 
@@ -486,23 +490,70 @@ class GameClient {
         await humanDelay(this.page, 1200, 2200);
 
         return await this.page.evaluate(() => {
-            const text = document.body ? document.body.innerText : '';
-            if (!text) return null;
+            const normalize = (txt) => (txt || '')
+                .toLowerCase()
+                .normalize('NFD')
+                .replace(/[\u0300-\u036f]/g, '')
+                .trim();
 
-            const patterns = [
-                /Tropas de la naturaleza[^\d]*(\d+)/i,
-                /Nature troops[^\d]*(\d+)/i,
-                /Naturtruppen[^\d]*(\d+)/i,
-                /Nature block[^\d]*(\d+)/i
+            const animalWords = [
+                'rata', 'ratas', 'rat', 'rats',
+                'arana', 'aranas', 'spider', 'spiders',
+                'serpiente', 'serpientes', 'snake', 'snakes',
+                'murcielago', 'murcielagos', 'bat', 'bats',
+                'jabali', 'jabalies', 'boar', 'boars',
+                'lobo', 'lobos', 'wolf', 'wolves',
+                'oso', 'osos', 'bear', 'bears',
+                'cocodrilo', 'cocodrilos', 'crocodile', 'crocodiles',
+                'tigre', 'tigres', 'tiger', 'tigers',
+                'elefante', 'elefantes', 'elephant', 'elephants'
             ];
 
+            const sumMatches = (source) => {
+                let total = 0;
+                let found = false;
+                for (const word of animalWords) {
+                    const regex = new RegExp(`(\\d+)\\s+${word}`, 'g');
+                    let m;
+                    while ((m = regex.exec(source)) !== null) {
+                        total += parseInt(m[1], 10);
+                        found = true;
+                    }
+                }
+                return found ? total : null;
+            };
+
+            // 1) Intentar sumar desde bloques cercanos a "Tropas"
+            const bodyText = normalize(document.body ? document.body.innerText : '');
+            if (bodyText) {
+                const nearTropas = bodyText.split('tropas').slice(1).join('tropas').slice(0, 400);
+                const parsedNear = sumMatches(nearTropas);
+                if (parsedNear !== null) return parsedNear;
+
+                const parsedBody = sumMatches(bodyText);
+                if (parsedBody !== null) return parsedBody;
+            }
+
+            // 2) Buscar listas de tropas en DOM (clases habituales)
+            const containers = Array.from(document.querySelectorAll('.troops, .troop, .troopWrapper, .troopList, .troopInfo, .unit, .units, .unitWrapper'));
+            for (const node of containers) {
+                const text = normalize(node.innerText);
+                if (!text) continue;
+                const parsed = sumMatches(text);
+                if (parsed !== null) return parsed;
+            }
+
+            // 3) Fallback clásico
+            const patterns = [
+                /tropas de la naturaleza[^\d]*(\d+)/i,
+                /nature troops[^\d]*(\d+)/i,
+                /naturtruppen[^\d]*(\d+)/i
+            ];
             for (const pattern of patterns) {
-                const match = text.match(pattern);
+                const match = bodyText.match(pattern);
                 if (match) return parseInt(match[1], 10);
             }
 
-            const fallback = text.match(/(\d+)\s*(?:nature troops|tropas de la naturaleza)/i);
-            if (fallback) return parseInt(fallback[1], 10);
             return null;
         });
     }
@@ -617,13 +668,48 @@ class GameClient {
         
         logger.info('Buscando botÃ³n de mejora...');
         const result = await this.page.evaluate(() => {
-            const buttons = Array.from(document.querySelectorAll('button.green'));
-            for (const btn of buttons) {
-                const text = btn.innerText.toLowerCase();
-                const classes = btn.className.toLowerCase();
-                if (classes.includes('gold')) continue;
-                if (text.includes('npc') || text.includes('intercambiar')) continue;
+            const normalize = (text) => (text || '')
+                .toLowerCase()
+                .normalize('NFD')
+                .replace(/[\u0300-\u036f]/g, '')
+                .trim();
+
+            const upgradeKeywords = ['mejora', 'mejorar', 'upgrade', 'construir', 'ampliar', 'nivel', 'level', 'build'];
+            const blacklist = ['prolong', 'proteger', 'protecc', 'protection', 'plus', 'premium', 'activar', 'comprar', 'confirmar', 'cancelar', 'aventura', 'mision', 'adventure', 'prorrogar'];
+
+            const collect = (root) => Array.from(root.querySelectorAll('button, input[type=\"submit\"], a.button'));
+            const scopes = [
+                document.querySelector('.buildAction'),
+                document.querySelector('#contract'),
+                document.querySelector('.upgradeButtons'),
+                document.querySelector('.buildWrapper'),
+                document.querySelector('.buildingDetails'),
+                document
+            ].filter(Boolean);
+
+            const seen = new Set();
+            const candidates = [];
+            for (const scope of scopes) {
+                for (const el of collect(scope)) {
+                    if (seen.has(el)) continue;
+                    seen.add(el);
+                    candidates.push(el);
+                }
+            }
+
+            for (const btn of candidates) {
+                const text = normalize(btn.innerText || btn.value || '');
+                const classes = normalize(btn.className || '');
+
                 if (btn.disabled || classes.includes('disabled')) continue;
+                if (classes.includes('gold')) continue;
+                if (blacklist.some(word => text.includes(word))) continue;
+                if (text.includes('npc') || text.includes('intercambiar')) continue;
+
+                const isUpgradeKeyword = upgradeKeywords.some(k => text.includes(k));
+                const isUpgradeClass = ['build', 'upgrade', 'contract'].some(k => classes.includes(k));
+                if (!isUpgradeKeyword && !isUpgradeClass) continue;
+
                 btn.click();
                 return { success: true };
             }
@@ -663,8 +749,8 @@ class GameClient {
             const targetIndex = identifierIsNumber ? parseInt(identifier, 10) : null;
             const targetName = identifierIsNumber ? null : normalize(identifier);
 
-            const rows = Array.from(document.querySelectorAll('form table tr, .trainUnits tr, .textList .unit, .unitWrapper'))
-                .filter(row => row.querySelector('input[name^="t"]'));
+            const allInputs = Array.from(document.querySelectorAll('input[name^="t"], input[name*="t"], input[data-unitid], input[data-unit], input[type="number"]'));
+            const rows = allInputs.map(input => input.closest('tr') || input.closest('.unit') || input.closest('.trainUnits') || input.closest('.textList') || input.closest('.unitWrapper') || input.parentElement).filter(Boolean);
 
             const pickQuantity = (row, input) => {
                 if (quantity !== -1) return quantity;
@@ -687,24 +773,36 @@ class GameClient {
                 return 0;
             };
 
+            const seen = new Set();
             for (const row of rows) {
-                const input = row.querySelector('input[name^="t"]');
+                if (seen.has(row)) continue;
+                seen.add(row);
+
+                const input = row.querySelector('input[name^="t"], input[name*="t"], input[data-unitid], input[data-unit], input[type="number"]');
                 if (!input) continue;
 
                 const inputName = input.getAttribute('name') || '';
+                const dataUnit = input.getAttribute('data-unitid') || input.getAttribute('data-unit') || null;
                 const indexMatch = inputName.match(/t(\d+)/);
-                const troopIndex = indexMatch ? parseInt(indexMatch[1], 10) : null;
+                const troopIndex = indexMatch ? parseInt(indexMatch[1], 10) : (dataUnit ? parseInt(dataUnit, 10) : null);
+
                 const rowText = normalize(row.innerText);
+                const imgAlt = normalize((row.querySelector('img') || {}).alt || '');
+                const candidateText = `${rowText} ${imgAlt}`.trim();
 
                 const matches = targetIndex !== null
                     ? troopIndex === targetIndex
-                    : rowText.includes(targetName);
+                    : candidateText.includes(targetName);
 
                 if (!matches) continue;
 
                 const qty = pickQuantity(row, input);
                 if (!qty || qty <= 0) {
-                    return { success: false, reason: 'not_enough_resources' };
+                    return { success: false, reason: 'not_enough_resources_or_zero_max' };
+                }
+
+                if (typeof input.scrollIntoView === 'function') {
+                    input.scrollIntoView({ behavior: 'smooth', block: 'center' });
                 }
 
                 input.value = qty;
@@ -718,11 +816,23 @@ class GameClient {
                 const btn = buttons.find(b => {
                     if (b.disabled) return false;
                     const label = normalize(b.innerText || b.value || '');
+                    if (label.includes('formacion') || label.includes('formar') || label.includes('formation')) return true;
                     return label.includes('entrenar') || label.includes('train') || label.includes('reclutar') || label.includes('enviar');
                 }) || buttons.find(b => !b.disabled);
 
                 if (!btn) return { success: false, reason: 'submit_button_not_found' };
+                if (typeof btn.scrollIntoView === 'function') {
+                    btn.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                }
                 btn.click();
+                const isSubmitBtn = (btn.tagName === 'BUTTON' && (btn.getAttribute('type') || '').toLowerCase() === 'submit') ||
+                    (btn.tagName === 'INPUT' && (btn.getAttribute('type') || '').toLowerCase() === 'submit');
+                if (typeof form.requestSubmit === 'function') {
+                    if (isSubmitBtn) form.requestSubmit(btn);
+                    else form.requestSubmit();
+                } else if (typeof form.submit === 'function') {
+                    form.submit();
+                }
                 return { success: true, trained: qty };
             }
 
@@ -731,7 +841,46 @@ class GameClient {
 
         if (!result.success) return result;
 
-        await humanDelay(this.page, 1600, 2400);
+        await humanDelay(this.page, 2000, 3200);
+
+        const verify = await this.page.evaluate(({ identifier }) => {
+            const normalize = (text) => (text || '')
+                .toLowerCase()
+                .normalize('NFD')
+                .replace(/[\u0300-\u036f]/g, '')
+                .trim();
+
+            const targetName = typeof identifier === 'string'
+                ? normalize(identifier)
+                : null;
+
+            const errorEl = document.querySelector('.error, .alert, .warning, .messageError');
+            if (errorEl) {
+                return { ok: false, reason: 'page_error', message: normalize(errorEl.innerText) };
+            }
+
+            const containers = Array.from(document.querySelectorAll('.under_progress, .under-progress, .productionWrapper, .trainUnits, .unitWrapper, .textList, .buildDetails, .details, .queue, .trainingQueue, .build_queue, .boxes-contents, .buildingList, .contract, body'));
+
+            for (const node of containers) {
+                const text = normalize(node.innerText || '');
+                if (!text) continue;
+
+                if (targetName) {
+                    if (text.includes(targetName)) return { ok: true };
+                } else {
+                    const anyMatch = text.match(/(\d+)\s*x?/);
+                    if (anyMatch) return { ok: true };
+                }
+            }
+
+            return { ok: false, reason: 'training_not_queued' };
+        }, { identifier: troopIdentifier }).catch(() => null);
+
+        if (!verify || !verify.ok) {
+            try { await this.screenshot('training-fail.png'); } catch (e) {}
+            return { success: false, reason: (verify && verify.reason) || 'training_not_queued', detail: (verify && verify.message) || null };
+        }
+
         return result;
     }
 
@@ -759,6 +908,7 @@ class GameClient {
 }
 
 module.exports = GameClient;
+
 
 
 
