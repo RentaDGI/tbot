@@ -280,9 +280,6 @@ class TaskRunner {
                             if (willReachTarget && nonResource.id) {
                                 await this.completeBuildTask(nonResource.id);
                                 logger.info('Tarea marcada como completada (nivel objetivo alcanzado o en cola).');
-                            } else if (targetLevel === null && nonResource.id) {
-                                // Sin objetivo definido, se mantiene el comportamiento anterior: completar tras un click exitoso.
-                                await this.completeBuildTask(nonResource.id);
                             } else if (targetLevel !== null && currentLevel !== null) {
                                 const remaining = Math.max(0, targetLevel - nextLevel);
                                 logger.info('Construccion en progreso. Quedan ' + remaining + ' nivel(es) para el objetivo.');

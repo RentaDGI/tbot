@@ -873,7 +873,8 @@ class GameClient {
                 '.under_progress', '.under-progress', '.trainingQueue', '.productionQueue',
                 '.queue', '.underConstruction', '.build_queue', '.buildingList .under_progress',
                 '.boxes-contents .under_progress', '.boxes-contents .under-progress',
-                '.productionWrapper .under_progress', '.productionWrapper .under-progress'
+                '.productionWrapper .under_progress', '.productionWrapper .under-progress',
+                '#trainQueue', '.trainingList', '.queueWrapper', '.unitQueue'
             ];
 
             const queueEntries = Array.from(document.querySelectorAll(queueSelectors.join(',')))
@@ -925,12 +926,19 @@ class GameClient {
                 }
             }
 
-            return { ok: false, reason: 'training_not_queued' };
+            const queueText = queueEntries.map(n => normalize(n.innerText || '')).filter(Boolean).slice(0, 5);
+
+            return { ok: false, reason: 'training_not_queued', queueText };
         }, { identifier: troopIdentifier }).catch(() => null);
 
         if (!verify || !verify.ok) {
             try { await this.screenshot('training-fail.png'); } catch (e) {}
-            return { success: false, reason: (verify && verify.reason) || 'training_not_queued', detail: (verify && verify.message) || null };
+            return {
+                success: false,
+                reason: (verify && verify.reason) || 'training_not_queued',
+                detail: (verify && verify.message) || null,
+                queueText: (verify && verify.queueText) || null
+            };
         }
 
         return result;
