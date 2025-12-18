@@ -56,9 +56,11 @@ async function addBuildTasks() {
     }
 
     // Insertar nuevas tareas
+    const defaultVillageId = (process.env.DEFAULT_VILLAGE_ID || 'main').trim();
     const tasksWithAccount = tasks.map(task => ({
         ...task,
         account_id: account.id,
+        village_id: (task.village_id || defaultVillageId || 'main'),
         status: 'pending'
     }));
 

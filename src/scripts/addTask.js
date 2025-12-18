@@ -16,6 +16,14 @@ const rl = readline.createInterface({
 
 const question = (prompt) => new Promise(resolve => rl.question(prompt, resolve));
 
+function normalizeVillageId(raw) {
+    const cleaned = (raw || '').toString().trim();
+    if (!cleaned) return 'main';
+    if (cleaned.toLowerCase() === 'main') return 'main';
+    const digitsOnly = cleaned.replace(/[^\d]/g, '');
+    return digitsOnly || cleaned;
+}
+
 // Tipos de recursos
 const RESOURCE_TYPES = {
     '1': { type: 'wood', name: 'Leñador', emoji: '🪵' },
@@ -115,6 +123,8 @@ async function addResourceTask(accountId) {
 
     const priority = await question('¿Prioridad? (1-10) [10]: ');
     const prio = parseInt(priority) || 10;
+    const villageIdInput = await question('Village id (newdid) [main]: ');
+    const villageId = normalizeVillageId(villageIdInput);
 
     const tasks = [];
 
@@ -124,6 +134,7 @@ async function addResourceTask(accountId) {
         Object.values(RESOURCE_TYPES).forEach(resource => {
             tasks.push({
                 account_id: accountId,
+                village_id: villageId,
                 building_type: resource.type,
                 building_name: resource.name,
                 target_level: level,
@@ -136,6 +147,7 @@ async function addResourceTask(accountId) {
         const resource = RESOURCE_TYPES[typeChoice];
         tasks.push({
             account_id: accountId,
+            village_id: villageId,
             building_type: resource.type,
             building_name: resource.name,
             target_level: level,
@@ -183,12 +195,25 @@ async function addBuildingTask(accountId, villageScan) {
         slot = COMMON_BUILDINGS[input].defaultSlot;
         buildingName = COMMON_BUILDINGS[input].name;
         const customSlot = await question(`¿Confirmar slot ${slot}? (Enter sí, o escribe otro): `);
-        if (customSlot.trim()) slot = parseInt(customSlot);
+        if (customSlot.trim()) {
+            const parsed = parseInt(customSlot.trim(), 10);
+            if (Number.isNaN(parsed)) {
+                console.log('ƒ?O El slot debe ser un numero. Se mantiene el slot por defecto.');
+            } else {
+                slot = parsed;
+            }
+        }
     } else {
         slot = parseInt(input);
         if (villageScan && villageScan.buildings) {
             const found = villageScan.buildings.find(b => b.slot === slot);
-            if (found) buildingName = found.name;
+            if (found) {
+                if (found.empty) {
+                    buildingName = await question('Edificio a construir en este slot: ');
+                } else {
+                    buildingName = found.name;
+                }
+            }
         }
         if (!buildingName) buildingName = await question('Nombre (opcional): ');
     }
@@ -196,8 +221,12 @@ async function addBuildingTask(accountId, villageScan) {
     const targetLevel = parseInt(await question('¿Hasta qué nivel?: '));
     const prio = parseInt(await question('¿Prioridad? (1-10) [5]: ') || 5);
 
+    const villageIdInput = await question('Village id (newdid) [main]: ');
+    const villageId = normalizeVillageId(villageIdInput);
+
     const { error } = await supabase.from('build_queue').insert({
         account_id: accountId,
+        village_id: villageId,
         building_slot: slot,
         building_name: buildingName || 'Edificio',
         target_level: targetLevel,
@@ -205,7 +234,11 @@ async function addBuildingTask(accountId, villageScan) {
         status: 'pending'
     });
 
-    if (!error) console.log(`\n✅ Tarea añadida: Slot ${slot} → Nivel ${targetLevel}`);
+    if (error) {
+        console.log('❌ Error:', error.message);
+    } else {
+        console.log(`\n✅ Tarea añadida: Slot ${slot} → Nivel ${targetLevel}`);
+    }
 }
 
 async function showCurrentTasks(accountId) {

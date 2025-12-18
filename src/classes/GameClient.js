@@ -1,5 +1,6 @@
 ﻿const { chromium } = require('playwright');
 const fs = require('fs');
+const https = require('https');
 const path = require('path');
 const { humanDelay, sleep } = require('../utils/time');
 const logger = require('../utils/logger');
@@ -29,6 +30,15 @@ class GameClient {
         this.fieldCache = null;
         this.lastScanTime = null;
         this.CACHE_DURATION = 30 * 60 * 1000;
+    }
+
+    _normalizeText(txt) {
+        return (txt || '')
+            .toLowerCase()
+            .normalize('NFD')
+            .replace(/[\u0300-\u036f]/g, '')
+            .replace(/\s+/g, ' ')
+            .trim();
     }
 
     async init() {
@@ -372,6 +382,121 @@ class GameClient {
         this.fieldCache = null;
         this.lastScanTime = null;
         logger.info('Cache de campos invalidada.');
+    }
+
+    async getVillages() {
+        if (this.page.isClosed()) return [];
+
+        return await this.page.evaluate(() => {
+            const normalize = (txt) => (txt || '')
+                .toLowerCase()
+                .normalize('NFD')
+                .replace(/[\u0300-\u036f]/g, '')
+                .replace(/\s+/g, ' ')
+                .trim();
+
+            const uniq = new Set();
+            const villages = [];
+
+            const links = Array.from(document.querySelectorAll(
+                '#sidebarBoxVillagelist a, .villageList a, a[href*="newdid="], a[href*="dorf1.php?newdid="], a[href*="dorf2.php?newdid="]'
+            ));
+
+            for (const a of links) {
+                const href = a.getAttribute('href') || '';
+                const match = href.match(/[?&]newdid=(\d+)/);
+                if (!match) continue;
+                const id = match[1];
+                const name = normalize(a.textContent || a.innerText || '') || id;
+                const key = `${id}|${name}`;
+                if (uniq.has(key)) continue;
+                uniq.add(key);
+                villages.push({ id, name });
+            }
+
+            const liCandidates = Array.from(document.querySelectorAll('#sidebarBoxVillagelist li, .villageList li'));
+            for (const li of liCandidates) {
+                const did = li.getAttribute('data-did') || (li.dataset ? li.dataset.did : null);
+                if (!did) continue;
+                const name = normalize(li.textContent || '') || String(did);
+                const key = `${did}|${name}`;
+                if (uniq.has(key)) continue;
+                uniq.add(key);
+                villages.push({ id: String(did), name });
+            }
+
+            return villages;
+        });
+    }
+
+    async switchToVillage(villageIdOrName) {
+        if (this.page.isClosed()) return false;
+
+        const targetRaw = (villageIdOrName || '').toString().trim();
+        if (!targetRaw || targetRaw.toLowerCase() === 'main') return true;
+
+        const clicked = await this.page.evaluate((target) => {
+            const normalize = (txt) => (txt || '')
+                .toLowerCase()
+                .normalize('NFD')
+                .replace(/[\u0300-\u036f]/g, '')
+                .replace(/\s+/g, ' ')
+                .trim();
+
+            const wanted = normalize(target);
+            const wantedIsId = /^\d+$/.test(wanted);
+
+            const links = Array.from(document.querySelectorAll(
+                '#sidebarBoxVillagelist a, .villageList a, a[href*="newdid="], a[href*="dorf1.php?newdid="], a[href*="dorf2.php?newdid="]'
+            ));
+
+            for (const a of links) {
+                const href = a.getAttribute('href') || '';
+                const m = href.match(/[?&]newdid=(\d+)/);
+                if (!m) continue;
+                const id = m[1];
+                const name = normalize(a.textContent || a.innerText || '') || id;
+
+                if (wantedIsId) {
+                    if (id === wanted) {
+                        a.click();
+                        return true;
+                    }
+                } else {
+                    if (name && (name === wanted || name.includes(wanted))) {
+                        a.click();
+                        return true;
+                    }
+                }
+            }
+
+            const items = Array.from(document.querySelectorAll('#sidebarBoxVillagelist li, .villageList li'));
+            for (const li of items) {
+                const did = li.getAttribute('data-did') || (li.dataset ? li.dataset.did : null);
+                const name = normalize(li.textContent || '') || String(did || '');
+                if (!did && !name) continue;
+
+                if (wantedIsId && did && String(did) === wanted) {
+                    li.click();
+                    return true;
+                }
+                if (!wantedIsId && name && (name === wanted || name.includes(wanted))) {
+                    li.click();
+                    return true;
+                }
+            }
+
+            return false;
+        }, targetRaw);
+
+        if (!clicked) {
+            logger.warn(`No se pudo cambiar a la aldea "${targetRaw}" (usa village_id=newdid o nombre aproximado).`);
+            return false;
+        }
+
+        await humanDelay(this.page, 1200, 2200);
+        this.invalidateCache();
+        return true;
     }
 
     logCacheStatus() {
@@ -728,6 +853,58 @@ class GameClient {
         return { success: false, reason: result.reason };
     }
 
+    async constructBuildingFromEmptySlot(buildingName) {
+        if (this.page.isClosed()) return { success: false, reason: 'browser_closed' };
+        const wanted = this._normalizeText(buildingName);
+        if (!wanted) return { success: false, reason: 'missing_building_name' };
+
+        const clicked = await this.page.evaluate((rawName) => {
+            const normalize = (txt) => (txt || '')
+                .toLowerCase()
+                .normalize('NFD')
+                .replace(/[\u0300-\u036f]/g, '')
+                .replace(/\s+/g, ' ')
+                .trim();
+
+            const wanted = normalize(rawName);
+
+            const anchorsRaw = Array.from(document.querySelectorAll('a[href*="gid="]'));
+            const anchors = anchorsRaw.length ? anchorsRaw : Array.from(document.querySelectorAll('a'));
+
+            for (const a of anchors) {
+                const href = a.getAttribute('href') || '';
+                if (!href.includes('gid=')) continue;
+                const t = normalize(a.textContent || a.innerText || '');
+                if (!t) continue;
+                if (t === wanted || t.includes(wanted)) {
+                    a.click();
+                    return true;
+                }
+            }
+
+            // Fallback: tarjetas/listas con nombre + link gid dentro
+            const cards = Array.from(document.querySelectorAll('.buildingWrapper, .building, .buildNewBuilding, .newBuilding, li, .content, #content'));
+            for (const c of cards) {
+                const t = normalize(c.textContent || '');
+                if (!t) continue;
+                if (!(t === wanted || t.includes(wanted))) continue;
+                const link = c.querySelector('a[href*="gid="]');
+                if (link) {
+                    link.click();
+                    return true;
+                }
+            }
+
+            return false;
+        }, buildingName);
+
+        if (!clicked) return { success: false, reason: 'building_choice_not_found' };
+
+        await humanDelay(this.page, 900, 1500);
+        const build = await this.upgradeBuild();
+        return build.success ? { success: true } : build;
+    }
+
     async executeTraining(buildingType, troopIdentifier, quantity = -1, buildingSlot = null) {
         if (this.page.isClosed()) return { success: false, reason: 'browser_closed' };
 
@@ -949,11 +1126,19 @@ class GameClient {
     async getBuildingInfo() {
         if (this.page.isClosed()) return {};
         return await this.page.evaluate(() => {
+            const isEmpty =
+                !!document.querySelector('.g0, .aid0, .buildingWrapper.g0, .buildingWrapper.aid0, .constructionSite, .buildNewBuilding, .newBuilding') ||
+                !!document.querySelector('a[href*="gid="], a[href*="gid="] .name');
+
             const titleEl = document.querySelector('.titleInHeader, h1');
-            if (!titleEl) return {};
-            const text = titleEl.textContent;
+            if (!titleEl) {
+                return { empty: isEmpty, name: null, level: 0 };
+            }
+
+            const text = (titleEl.textContent || '').trim();
             const levelMatch = text.match(/(\d+)/);
             return {
+                empty: false,
                 name: text.replace(/\d+/, '').trim(),
                 level: levelMatch ? parseInt(levelMatch[0]) : 0
             };
@@ -1024,6 +1209,12 @@ class GameClient {
         }
         coords.sort((a, b) => a.dist - b.dist);
         return coords;
+    }
+
+    _distance(aX, aY, bX, bY) {
+        const dx = bX - aX;
+        const dy = bY - aY;
+        return Math.sqrt(dx * dx + dy * dy);
     }
 
     async _getMapTileVillageInfo(x, y) {
@@ -1168,13 +1359,177 @@ class GameClient {
         return await this.findBuildingSlot('rallyPoint', explicitSlot);
     }
 
-    async openFarmList(listName, options = {}) {
+    _farmListNameForIndex(baseName, index) {
+        if (index <= 1) return baseName;
+        return `${baseName}-${index}`;
+    }
+
+    async _openFarmListTab(options = {}) {
         if (this.page.isClosed()) return false;
         const rallySlot = await this.findRallyPointSlot(options.rallySlot);
         if (!rallySlot) throw new Error('No se pudo localizar la Plaza de reuniones (rally point).');
 
         await this.page.goto(`${process.env.GAME_URL}/build.php?id=${rallySlot}`, { waitUntil: 'domcontentloaded' });
         await humanDelay(this.page, 1200, 2000);
+
+        const openedTab = await this.page.evaluate(() => {
+            const normalize = (txt) => (txt || '')
+                .toLowerCase()
+                .normalize('NFD')
+                .replace(/[\u0300-\u036f]/g, '')
+                .trim();
+
+            const wanted = ['lista de vacas', 'farm list', 'raid list'];
+            const candidates = Array.from(document.querySelectorAll('a, button'));
+            for (const el of candidates) {
+                const t = normalize(el.textContent || el.innerText || el.value);
+                if (wanted.some(w => t.includes(normalize(w)))) {
+                    el.click();
+                    return true;
+                }
+            }
+            return false;
+        });
+
+        if (!openedTab) {
+            logger.warn('No se pudo abrir la pesta¤a de "Lista de vacas" por texto. Continuando igualmente...');
+        }
+
+        await humanDelay(this.page, 900, 1500);
+        return true;
+    }
+
+    async _getFarmListNamesOnPage() {
+        if (this.page.isClosed()) return [];
+
+        return await this.page.evaluate(() => {
+            const normalize = (txt) => (txt || '')
+                .toLowerCase()
+                .normalize('NFD')
+                .replace(/[\u0300-\u036f]/g, '')
+                .replace(/\s+/g, ' ')
+                .trim();
+
+            const uniq = new Set();
+            const names = [];
+
+            const listCandidates = Array.from(document.querySelectorAll(
+                'a, button, .raidList, .listEntry, .listTitle, .name, .raidListTitle, .listTitleText'
+            ));
+
+            for (const el of listCandidates) {
+                const t = normalize(el.textContent || el.innerText || '');
+                if (!t) continue;
+                if (t.length > 50) continue;
+                if (t.includes('comenzar') || t.includes('start all') || t.includes('todas las')) continue;
+                if (uniq.has(t)) continue;
+                uniq.add(t);
+                names.push(t);
+            }
+
+            return names;
+        });
+    }
+
+    async _selectFarmListOnPage(listName) {
+        if (this.page.isClosed()) return false;
+
+        const selectedList = await this.page.evaluate((rawName) => {
+            const normalize = (txt) => (txt || '')
+                .toLowerCase()
+                .normalize('NFD')
+                .replace(/[\u0300-\u036f]/g, '')
+                .replace(/\s+/g, ' ')
+                .trim();
+
+            const wanted = normalize(rawName);
+            const listCandidates = Array.from(document.querySelectorAll('a, button, .raidList, .listEntry, .listTitle, .name, .raidListTitle, .listTitleText'));
+
+            for (const el of listCandidates) {
+                const t = normalize(el.textContent || el.innerText || '');
+                if (!t) continue;
+                if (t === wanted || t.includes(wanted)) {
+                    el.click();
+                    return true;
+                }
+            }
+            return false;
+        }, listName);
+
+        if (selectedList) await humanDelay(this.page, 800, 1400);
+        return !!selectedList;
+    }
+
+    async _createFarmListOnPage(listName) {
+        if (this.page.isClosed()) return false;
+
+        const created = await this.page.evaluate((rawName) => {
+            const normalize = (txt) => (txt || '')
+                .toLowerCase()
+                .normalize('NFD')
+                .replace(/[\u0300-\u036f]/g, '')
+                .replace(/\s+/g, ' ')
+                .trim();
+
+            const wantedCreate = [
+                'nueva lista', 'crear lista', 'crear nueva lista', 'nueva lista de vacas',
+                'new list', 'create list', 'create new list', 'new farm list', 'new raid list'
+            ];
+
+            const clickCreate = () => {
+                const candidates = Array.from(document.querySelectorAll('a, button, input[type="button"], input[type="submit"]'));
+                for (const el of candidates) {
+                    const t = normalize(el.textContent || el.innerText || el.value);
+                    if (!t) continue;
+                    if (wantedCreate.some(w => t.includes(normalize(w)))) {
+                        el.click();
+                        return true;
+                    }
+                }
+                return false;
+            };
+
+            const clicked = clickCreate();
+            if (!clicked) return false;
+
+            const name = String(rawName || '').trim();
+            if (!name) return false;
+
+            const input =
+                document.querySelector('input[name*="name" i]') ||
+                document.querySelector('input[id*="name" i]') ||
+                document.querySelector('input[placeholder*="nombre" i]') ||
+                document.querySelector('input[placeholder*="name" i]');
+
+            if (input) {
+                input.focus();
+                input.value = name;
+                input.dispatchEvent(new Event('input', { bubbles: true }));
+                input.dispatchEvent(new Event('change', { bubbles: true }));
+            }
+
+            const wantedOk = ['crear', 'guardar', 'ok', 'aceptar', 'save', 'create'];
+            const buttons = Array.from(document.querySelectorAll('button, input[type="submit"], input[type="button"], a.button'));
+            for (const el of buttons) {
+                const t = normalize(el.textContent || el.innerText || el.value);
+                if (!t) continue;
+                if (wantedOk.some(w => t === normalize(w) || t.includes(normalize(w)))) {
+                    el.click();
+                    return true;
+                }
+            }
+
+            return true;
+        }, listName);
+
+        if (created) await humanDelay(this.page, 1200, 2000);
+        return !!created;
+    }
+
+    async openFarmList(listName, options = {}) {
+        if (this.page.isClosed()) return false;
+
+        await this._openFarmListTab({ rallySlot: options.rallySlot });
 
         const openedTab = await this.page.evaluate(() => {
             const normalize = (txt) => (txt || '')
@@ -1223,7 +1578,21 @@ class GameClient {
             return false;
         }, listName);
 
-        if (!selectedList) {
+        let selected = selectedList;
+        if (!selected && options.createIfMissing) {
+            const existingNames = await this._getFarmListNamesOnPage();
+            const wanted = this._normalizeText(listName);
+            const exists = existingNames.some(n => n === wanted || n.includes(wanted));
+
+            if (!exists) {
+                logger.info(`Creando lista de vacas: "${listName}"...`);
+                await this._createFarmListOnPage(listName);
+            }
+
+            selected = await this._selectFarmListOnPage(listName);
+        }
+
+        if (!selected) {
             logger.warn(`No se pudo seleccionar la lista "${listName}" por texto. Si ya está abierta, esto es normal.`);
         } else {
             await humanDelay(this.page, 800, 1400);
@@ -1552,6 +1921,7 @@ class GameClient {
         const maxPopulation = typeof options.maxPopulation === 'number' ? options.maxPopulation : 50;
         const maxDistance = typeof options.maxDistance === 'number' ? options.maxDistance : 20;
         const troopCounts = options.troopCounts || { t1: 2 };
+        // maxTargets = total deseado en la lista (no "nuevos a a¤adir")
         const maxTargets = typeof options.maxTargets === 'number' ? options.maxTargets : 100;
         const applyTroopsToExisting = options.applyTroopsToExisting !== false;
         const addMethod = options.addMethod || 'map';
@@ -1569,11 +1939,16 @@ class GameClient {
         const existingSet = new Set(existing.map(t => `${t.x}|${t.y}`));
         logger.info(`Objetivos actuales en lista "${listName}": ${existing.length}`);
 
+        const remaining = Math.max(0, maxTargets - existing.length);
+        if (remaining === 0) {
+            logger.info(`La lista "${listName}" ya tiene ${existing.length} objetivos (max=${maxTargets}).`);
+        }
+
         const coordList = this._generateCoordsInRadius(center.x, center.y, maxDistance);
         const added = [];
 
         for (const c of coordList) {
-            if (added.length >= maxTargets) break;
+            if (added.length >= remaining) break;
             const key = `${c.x}|${c.y}`;
             if (existingSet.has(key)) continue;
 
@@ -1628,6 +2003,472 @@ class GameClient {
             maxDistance,
             troopCounts,
             maxTargets
+        };
+    }
+
+    async updateFarmListsFromNearbyVillages(options = {}) {
+        const listName = options.listName || 'raid';
+        const maxPopulation = typeof options.maxPopulation === 'number' ? options.maxPopulation : 50;
+        const maxDistance = typeof options.maxDistance === 'number' ? options.maxDistance : 20;
+        const troopCounts = options.troopCounts || { t1: 2 };
+        const maxTargetsPerList = typeof options.maxTargetsPerList === 'number' ? options.maxTargetsPerList : 100;
+        const totalTargets = typeof options.totalTargets === 'number' ? options.totalTargets : maxTargetsPerList;
+        const applyTroopsToExisting = options.applyTroopsToExisting !== false;
+        const addMethod = options.addMethod || 'map';
+        const maxLists = typeof options.maxLists === 'number' ? options.maxLists : 20;
+
+        const center = await this.getCurrentVillageCoordinates({ x: options.centerX, y: options.centerY });
+        logger.info(`Centro de busqueda: (${center.x}|${center.y}) [${center.source}]`);
+
+        const wantedTotal = Math.max(0, totalTargets);
+        if (wantedTotal === 0) {
+            return {
+                center,
+                listName,
+                addedCount: 0,
+                added: [],
+                lists: [],
+                maxPopulation,
+                maxDistance,
+                troopCounts,
+                maxTargetsPerList,
+                totalTargets: wantedTotal,
+                source: 'map'
+            };
+        }
+
+        const coordList = this._generateCoordsInRadius(center.x, center.y, maxDistance);
+        const globalExistingSet = new Set();
+        const added = [];
+        const lists = [];
+        let cursor = 0;
+
+        for (let listIndex = 1; listIndex <= maxLists && added.length < wantedTotal; listIndex += 1) {
+            const currentListName = this._farmListNameForIndex(listName, listIndex);
+            await this.openFarmList(currentListName, { rallySlot: options.rallySlot, createIfMissing: true });
+
+            if (applyTroopsToExisting) {
+                const changed = await this.setFarmListTroopsForAllTargets(troopCounts);
+                if (changed > 0) logger.info(`Tropas aplicadas a objetivos existentes (${currentListName}): ${changed}`);
+            }
+
+            const existing = await this.getFarmListTargets();
+            for (const t of existing) globalExistingSet.add(`${t.x}|${t.y}`);
+            logger.info(`Objetivos actuales en lista "${currentListName}": ${existing.length}`);
+
+            const remainingInList = Math.max(0, maxTargetsPerList - existing.length);
+            if (remainingInList === 0) {
+                lists.push({ listName: currentListName, addedCount: 0, existingCount: existing.length, isFull: true });
+                continue;
+            }
+
+            const remainingTotal = wantedTotal - added.length;
+            const toAddHere = Math.min(remainingInList, remainingTotal);
+            let addedThisList = 0;
+
+            while (addedThisList < toAddHere && cursor < coordList.length) {
+                const c = coordList[cursor];
+                cursor += 1;
+
+                const key = `${c.x}|${c.y}`;
+                if (globalExistingSet.has(key)) continue;
+
+                let info = null;
+                try {
+                    info = await this._getMapTileVillageInfo(c.x, c.y);
+                } catch (e) {
+                    logger.warn(`Error leyendo mapa en (${c.x}|${c.y}): ${e.message}`);
+                    continue;
+                }
+
+                if (!info) continue;
+                if (typeof info.population !== 'number') continue;
+                if (info.population >= maxPopulation) continue;
+
+                logger.info(`Anadiendo objetivo (${c.x}|${c.y}) hab=${info.population} dist=${c.dist.toFixed(1)} -> ${currentListName}`);
+
+                try {
+                    let addedOk = false;
+
+                    if (addMethod === 'map') {
+                        addedOk = await this.addToFarmListFromMap(c.x, c.y, currentListName);
+                    }
+
+                    if (!addedOk) {
+                        await this.openFarmList(currentListName, { rallySlot: options.rallySlot });
+                        await this.addFarmListTarget(c.x, c.y, { name: info.name || undefined });
+                        addedOk = true;
+                    }
+
+                    if (!addedOk) throw new Error('No se pudo agregar a la lista.');
+                    globalExistingSet.add(key);
+                    added.push({ x: c.x, y: c.y, population: info.population, dist: c.dist, listName: currentListName });
+                    addedThisList += 1;
+                } catch (e) {
+                    logger.warn(`No se pudo anadir (${c.x}|${c.y}): ${e.message}`);
+                }
+            }
+
+            await this.openFarmList(currentListName, { rallySlot: options.rallySlot });
+            await this.setFarmListTroopsForAllTargets(troopCounts);
+            await this.saveFarmListIfNeeded();
+
+            lists.push({ listName: currentListName, addedCount: addedThisList, existingCount: existing.length, isFull: addedThisList >= remainingInList });
+
+            if (cursor >= coordList.length) break;
+        }
+
+        return {
+            center,
+            listName,
+            addedCount: added.length,
+            added,
+            lists,
+            maxPopulation,
+            maxDistance,
+            troopCounts,
+            maxTargetsPerList,
+            totalTargets: wantedTotal,
+            source: 'map'
+        };
+    }
+
+    async _httpGetText(url, options = {}) {
+        const timeoutMs = typeof options.timeoutMs === 'number' ? options.timeoutMs : 25000;
+
+        return await new Promise((resolve, reject) => {
+            const req = https.get(url, {
+                headers: {
+                    'User-Agent': 'travian-bot/1.0 (+https://github.com/)',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                    // Evitar compresion para simplificar el parsing
+                    'Accept-Encoding': 'identity'
+                }
+            }, (res) => {
+                if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+                    const next = new URL(res.headers.location, url).toString();
+                    res.resume();
+                    this._httpGetText(next, options).then(resolve, reject);
+                    return;
+                }
+
+                if (!res.statusCode || res.statusCode < 200 || res.statusCode >= 300) {
+                    const code = res.statusCode || 'unknown';
+                    res.resume();
+                    reject(new Error(`HTTP ${code} al descargar ${url}`));
+                    return;
+                }
+
+                res.setEncoding('utf8');
+                let data = '';
+                res.on('data', (chunk) => { data += chunk; });
+                res.on('end', () => resolve(data));
+            });
+
+            req.on('error', reject);
+            req.setTimeout(timeoutMs, () => req.destroy(new Error(`Timeout descargando ${url}`)));
+        });
+    }
+
+    _parseInactiveSearchCoords(html) {
+        const coords = [];
+        // Ejemplo: <small class="text-muted">(-78|-72)</small>
+        const re = /<small[^>]*class="[^"]*text-muted[^"]*"[^>]*>\s*\(\s*(-?\d+)\s*\|\s*(-?\d+)\s*\)\s*<\/small>/gi;
+        let m;
+        while ((m = re.exec(html))) {
+            const x = parseInt(m[1], 10);
+            const y = parseInt(m[2], 10);
+            if (Number.isNaN(x) || Number.isNaN(y)) continue;
+            coords.push({ x, y });
+        }
+        return coords;
+    }
+
+    async _getInactiveSearchCoords(options = {}) {
+        const inactiveSearchUrl = options.inactiveSearchUrl;
+        if (!inactiveSearchUrl) throw new Error('Falta inactiveSearchUrl');
+
+        const maxPages = typeof options.maxPages === 'number' ? options.maxPages : 20;
+        const limit = typeof options.limit === 'number' ? options.limit : 200;
+
+        const seen = new Set();
+        const out = [];
+
+        for (let page = 1; page <= maxPages; page += 1) {
+            const url = new URL(inactiveSearchUrl);
+            if (page > 1) url.searchParams.set('page', String(page));
+
+            logger.info(`InactiveSearch: descargando p${page}...`);
+            const html = await this._httpGetText(url.toString(), { timeoutMs: 25000 });
+            const coords = this._parseInactiveSearchCoords(html);
+
+            if (coords.length === 0) break;
+
+            let addedFromPage = 0;
+            for (const c of coords) {
+                const key = `${c.x}|${c.y}`;
+                if (seen.has(key)) continue;
+                seen.add(key);
+                out.push(c);
+                addedFromPage += 1;
+                if (out.length >= limit) return out;
+            }
+
+            if (addedFromPage === 0) break;
+        }
+
+        return out;
+    }
+
+    async updateFarmListFromInactiveSearch(options = {}) {
+        const listName = options.listName || 'raid';
+        const troopCounts = options.troopCounts || { t1: 2 };
+        // maxTargets = total deseado en la lista (no "nuevos a a¤adir")
+        const maxTargets = typeof options.maxTargets === 'number' ? options.maxTargets : 100;
+        const applyTroopsToExisting = options.applyTroopsToExisting !== false;
+        const maxDistance = typeof options.maxDistance === 'number' ? options.maxDistance : null;
+
+        const inactiveSearchUrl = options.inactiveSearchUrl;
+        if (!inactiveSearchUrl) throw new Error('FARM_INACTIVESEARCH_URL es obligatorio para usar InactiveSearch.');
+
+        const center = await this.getCurrentVillageCoordinates({ x: options.centerX, y: options.centerY });
+        logger.info(`Centro de referencia: (${center.x}|${center.y}) [${center.source}]`);
+
+        await this.openFarmList(listName, { rallySlot: options.rallySlot });
+        if (applyTroopsToExisting) {
+            const changed = await this.setFarmListTroopsForAllTargets(troopCounts);
+            if (changed > 0) logger.info(`Tropas aplicadas a objetivos existentes: ${changed}`);
+        }
+
+        const existing = await this.getFarmListTargets();
+        const existingSet = new Set(existing.map(t => `${t.x}|${t.y}`));
+        logger.info(`Objetivos actuales en lista "${listName}": ${existing.length}`);
+
+        const remaining = Math.max(0, maxTargets - existing.length);
+        if (remaining === 0) {
+            logger.info(`La lista "${listName}" ya tiene ${existing.length} objetivos (max=${maxTargets}).`);
+            return {
+                center,
+                listName,
+                addedCount: 0,
+                added: [],
+                troopCounts,
+                maxTargets,
+                source: 'inactivesearch'
+            };
+        }
+
+        const verifyMaxPopulation = typeof options.maxPopulation === 'number' ? options.maxPopulation : null;
+        const maxPages = typeof options.inactiveSearchMaxPages === 'number' ? options.inactiveSearchMaxPages : 30;
+        const candidates = await this._getInactiveSearchCoords({
+            inactiveSearchUrl,
+            maxPages,
+            limit: Math.max(remaining * 20, remaining)
+        });
+
+        const sortedCandidates = candidates
+            .map(c => ({ ...c, dist: this._distance(center.x, center.y, c.x, c.y) }))
+            .filter(c => (maxDistance === null ? true : c.dist <= maxDistance))
+            .sort((a, b) => a.dist - b.dist);
+
+        logger.info(`InactiveSearch: candidatos obtenidos=${candidates.length}, tras filtro/orden=${sortedCandidates.length}, a¤adir=${remaining}`);
+        if (maxDistance !== null && sortedCandidates.length < remaining) {
+            logger.warn(`InactiveSearch: no hay suficientes candidatos dentro de dist<=${maxDistance}. Considera subir FARM_MAX_DIST o cambiar la coordenada (c=...) del buscador.`);
+        }
+
+        const added = [];
+        for (const c of sortedCandidates) {
+            if (added.length >= remaining) break;
+
+            const key = `${c.x}|${c.y}`;
+            if (existingSet.has(key)) continue;
+
+            let info = null;
+            try {
+                info = await this._getMapTileVillageInfo(c.x, c.y);
+            } catch (e) {
+                logger.warn(`Error leyendo mapa en (${c.x}|${c.y}): ${e.message}`);
+                continue;
+            }
+
+            if (!info) continue;
+            if (verifyMaxPopulation !== null && typeof info.population === 'number' && info.population >= verifyMaxPopulation) {
+                continue;
+            }
+
+            logger.info(`Anadiendo objetivo (${c.x}|${c.y}) hab=${info.population} dist=${c.dist.toFixed(1)}`);
+
+            try {
+                let addedOk = false;
+
+                // _getMapTileVillageInfo deja la pagina en el detalle del mapa, asi que usamos el flow "map"
+                addedOk = await this.addToFarmListFromMap(c.x, c.y, listName);
+
+                // Fallback: a¤adir desde la farmlist con nombre si esta disponible
+                if (!addedOk) {
+                    await this.openFarmList(listName, { rallySlot: options.rallySlot });
+                    await this.addFarmListTarget(c.x, c.y, { name: info.name || undefined });
+                    addedOk = true;
+                }
+
+                if (!addedOk) throw new Error('No se pudo agregar a la lista.');
+                existingSet.add(key);
+                added.push({ x: c.x, y: c.y, population: info.population, dist: c.dist });
+            } catch (e) {
+                logger.warn(`No se pudo anadir (${c.x}|${c.y}): ${e.message}`);
+            }
+        }
+
+        await this.openFarmList(listName, { rallySlot: options.rallySlot });
+        await this.setFarmListTroopsForAllTargets(troopCounts);
+        await this.saveFarmListIfNeeded();
+
+        return {
+            center,
+            listName,
+            addedCount: added.length,
+            added,
+            troopCounts,
+            maxTargets,
+            source: 'inactivesearch'
+        };
+    }
+
+    async updateFarmListsFromInactiveSearch(options = {}) {
+        const listName = options.listName || 'raid';
+        const troopCounts = options.troopCounts || { t1: 2 };
+        const maxTargetsPerList = typeof options.maxTargetsPerList === 'number' ? options.maxTargetsPerList : 100;
+        const totalTargets = typeof options.totalTargets === 'number' ? options.totalTargets : maxTargetsPerList;
+        const applyTroopsToExisting = options.applyTroopsToExisting !== false;
+        const maxDistance = typeof options.maxDistance === 'number' ? options.maxDistance : null;
+        const maxLists = typeof options.maxLists === 'number' ? options.maxLists : 20;
+
+        const inactiveSearchUrl = options.inactiveSearchUrl;
+        if (!inactiveSearchUrl) throw new Error('FARM_INACTIVESEARCH_URL es obligatorio para usar InactiveSearch.');
+
+        const wantedTotal = Math.max(0, totalTargets);
+        if (wantedTotal === 0) {
+            return {
+                center: await this.getCurrentVillageCoordinates({ x: options.centerX, y: options.centerY }),
+                listName,
+                addedCount: 0,
+                added: [],
+                lists: [],
+                troopCounts,
+                maxTargetsPerList,
+                totalTargets: wantedTotal,
+                source: 'inactivesearch'
+            };
+        }
+
+        const center = await this.getCurrentVillageCoordinates({ x: options.centerX, y: options.centerY });
+        logger.info(`Centro de referencia: (${center.x}|${center.y}) [${center.source}]`);
+
+        const verifyMaxPopulation = typeof options.maxPopulation === 'number' ? options.maxPopulation : null;
+        const maxPages = typeof options.inactiveSearchMaxPages === 'number' ? options.inactiveSearchMaxPages : 30;
+        const candidates = await this._getInactiveSearchCoords({
+            inactiveSearchUrl,
+            maxPages,
+            limit: Math.max(wantedTotal * 20, wantedTotal)
+        });
+
+        const sortedCandidates = candidates
+            .map(c => ({ ...c, dist: this._distance(center.x, center.y, c.x, c.y) }))
+            .filter(c => (maxDistance === null ? true : c.dist <= maxDistance))
+            .sort((a, b) => a.dist - b.dist);
+
+        logger.info(`InactiveSearch: candidatos obtenidos=${candidates.length}, tras filtro/orden=${sortedCandidates.length}, objetivo_total=${wantedTotal}`);
+        if (maxDistance !== null && sortedCandidates.length < wantedTotal) {
+            logger.warn(`InactiveSearch: no hay suficientes candidatos dentro de dist<=${maxDistance}. Considera subir FARM_MAX_DIST o cambiar la coordenada (c=...) del buscador.`);
+        }
+
+        const globalExistingSet = new Set();
+        const added = [];
+        const lists = [];
+        let cursor = 0;
+
+        for (let listIndex = 1; listIndex <= maxLists && added.length < wantedTotal; listIndex += 1) {
+            const currentListName = this._farmListNameForIndex(listName, listIndex);
+            await this.openFarmList(currentListName, { rallySlot: options.rallySlot, createIfMissing: true });
+
+            if (applyTroopsToExisting) {
+                const changed = await this.setFarmListTroopsForAllTargets(troopCounts);
+                if (changed > 0) logger.info(`Tropas aplicadas a objetivos existentes (${currentListName}): ${changed}`);
+            }
+
+            const existing = await this.getFarmListTargets();
+            for (const t of existing) globalExistingSet.add(`${t.x}|${t.y}`);
+            logger.info(`Objetivos actuales en lista "${currentListName}": ${existing.length}`);
+
+            const remainingInList = Math.max(0, maxTargetsPerList - existing.length);
+            if (remainingInList === 0) {
+                lists.push({ listName: currentListName, addedCount: 0, existingCount: existing.length, isFull: true });
+                continue;
+            }
+
+            const remainingTotal = wantedTotal - added.length;
+            const toAddHere = Math.min(remainingInList, remainingTotal);
+            let addedThisList = 0;
+
+            while (addedThisList < toAddHere && cursor < sortedCandidates.length) {
+                const c = sortedCandidates[cursor];
+                cursor += 1;
+
+                const key = `${c.x}|${c.y}`;
+                if (globalExistingSet.has(key)) continue;
+
+                let info = null;
+                try {
+                    info = await this._getMapTileVillageInfo(c.x, c.y);
+                } catch (e) {
+                    logger.warn(`Error leyendo mapa en (${c.x}|${c.y}): ${e.message}`);
+                    continue;
+                }
+
+                if (!info) continue;
+                if (verifyMaxPopulation !== null && typeof info.population === 'number' && info.population >= verifyMaxPopulation) {
+                    continue;
+                }
+
+                logger.info(`Anadiendo objetivo (${c.x}|${c.y}) hab=${info.population} dist=${c.dist.toFixed(1)} -> ${currentListName}`);
+
+                try {
+                    let addedOk = false;
+                    addedOk = await this.addToFarmListFromMap(c.x, c.y, currentListName);
+                    if (!addedOk) {
+                        await this.openFarmList(currentListName, { rallySlot: options.rallySlot });
+                        await this.addFarmListTarget(c.x, c.y, { name: info.name || undefined });
+                        addedOk = true;
+                    }
+
+                    if (!addedOk) throw new Error('No se pudo agregar a la lista.');
+                    globalExistingSet.add(key);
+                    added.push({ x: c.x, y: c.y, population: info.population, dist: c.dist, listName: currentListName });
+                    addedThisList += 1;
+                } catch (e) {
+                    logger.warn(`No se pudo anadir (${c.x}|${c.y}): ${e.message}`);
+                }
+            }
+
+            await this.openFarmList(currentListName, { rallySlot: options.rallySlot });
+            await this.setFarmListTroopsForAllTargets(troopCounts);
+            await this.saveFarmListIfNeeded();
+
+            lists.push({ listName: currentListName, addedCount: addedThisList, existingCount: existing.length, isFull: addedThisList >= remainingInList });
+
+            if (cursor >= sortedCandidates.length) break;
+        }
+
+        return {
+            center,
+            listName,
+            addedCount: added.length,
+            added,
+            lists,
+            troopCounts,
+            maxTargetsPerList,
+            totalTargets: wantedTotal,
+            source: 'inactivesearch'
         };
     }
 

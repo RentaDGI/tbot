@@ -112,13 +112,21 @@ class TaskRunner {
                 let buildResult = { success: false, reason: 'no_tasks' };
                 
                 if (buildTasks.length > 0) {
-                    const completedTasks = this.client.getCompletedResourceTasks(buildTasks);
+                    const activeVillageId = (buildTasks[0].village_id || 'main');
+                    await this.client.switchToVillage(activeVillageId);
+
+                    const buildTasksForVillage = buildTasks.filter(t => (t.village_id || 'main') === activeVillageId);
+                    if (buildTasksForVillage.length !== buildTasks.length) {
+                        logger.info('Construccion: procesando aldea ' + activeVillageId + ' (' + buildTasksForVillage.length + '/' + buildTasks.length + ' tareas)');
+                    }
+
+                    const completedTasks = this.client.getCompletedResourceTasks(buildTasksForVillage);
                     for (const task of completedTasks) {
                         logger.success('Construccion completada: ' + task.building_name);
                         await this.completeBuildTask(task.id);
                     }
 
-                    const remainingBuild = buildTasks.filter(function(t) {
+                    const remainingBuild = buildTasksForVillage.filter(function(t) {
                         return !completedTasks.find(function(ct) { return ct.id === t.id; });
                     });
 
@@ -281,6 +289,28 @@ class TaskRunner {
             const nonResourceTasks = tasks.filter(t => !t.building_type);
             const lowestField = this.client.findLowestFieldAcrossAllTasks(tasks, resourceAmounts);
 
+            const normalize = (txt) => (txt || '')
+                .toLowerCase()
+                .normalize('NFD')
+                .replace(/[\u0300-\u036f]/g, '')
+                .replace(/\s+/g, ' ')
+                .trim();
+
+            const namesMatch = (a, b) => {
+                const na = normalize(a);
+                const nb = normalize(b);
+                if (!na || !nb) return false;
+                return na === nb || na.includes(nb) || nb.includes(na);
+            };
+
+            const failBuildTask = async (taskId, message, status = 'skipped') => {
+                if (!taskId) return;
+                await this.supabase
+                    .from('build_queue')
+                    .update({ status, error_message: message || null, completed_at: new Date() })
+                    .eq('id', taskId);
+            };
+
             const tryNonResource = async () => {
                 if (!nonResourceTasks.length) return { success: false, reason: 'no_nonresource_tasks' };
                 let completedAny = false;
@@ -302,6 +332,48 @@ class TaskRunner {
 
                         try {
                             const info = await this.client.getBuildingInfo();
+
+                            if (info && info.empty) {
+                                currentLevel = 0;
+
+                                const nameForBuild = (nonResource.building_name || '').trim();
+                                if (!nameForBuild) {
+                                    logger.warn('Slot vacio pero no se indico building_name para construir (task id: ' + (nonResource.id || 'sin-id') + ').');
+                                    continue;
+                                }
+
+                                const buildNew = await this.client.constructBuildingFromEmptySlot(nameForBuild);
+                                if (buildNew && buildNew.success) {
+                                    const nextLevel = 1;
+                                    const willReachTarget = targetLevel !== null && nextLevel >= targetLevel;
+
+                                    logger.success('Construccion (nuevo edificio): ' + nameForBuild + ' (Nivel 1)');
+
+                                    if (willReachTarget && nonResource.id) {
+                                        await this.completeBuildTask(nonResource.id);
+                                        logger.info('Tarea marcada como completada (nivel objetivo alcanzado).');
+                                    }
+
+                                    return { success: true };
+                                }
+
+                                const reason = (buildNew && buildNew.reason) || 'unknown';
+                                logger.info('No se pudo construir edificio nuevo (motivo: ' + reason + ').');
+                                if (nonResource.id) await failBuildTask(nonResource.id, `No se pudo construir edificio nuevo: ${reason}`, 'failed');
+                                continue;
+                            }
+
+                            // Proteccion: si el slot ya tiene un edificio distinto al solicitado, NO lo subimos
+                            if (info && !info.empty && targetSlot && nonResource.building_name) {
+                                if (!namesMatch(info.name, nonResource.building_name)) {
+                                    const msg = `Slot ${targetSlot} tiene "${info.name}", no "${nonResource.building_name}".`;
+                                    logger.warn('Construccion: ' + msg + ' Se omite esta tarea.');
+                                    if (nonResource.id) await failBuildTask(nonResource.id, msg, 'skipped');
+                                    completedAny = true;
+                                    continue;
+                                }
+                            }
+
                             if (info && typeof info.level === 'number') currentLevel = info.level;
                         } catch (infoErr) {
                             logger.warn('No se pudo leer el nivel actual del edificio: ' + infoErr.message);
@@ -342,6 +414,7 @@ class TaskRunner {
                         }
                     } catch (e) {
                         logger.warn('No se pudo ejecutar tarea de edificio: ' + e.message);
+                        if (nonResource.id) await failBuildTask(nonResource.id, e.message || 'building_task_failed', 'failed');
                         return { success: false, reason: 'building_task_failed' };
                     }
                 }
