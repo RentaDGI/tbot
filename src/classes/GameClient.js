@@ -9,13 +9,15 @@ const BUILDING_KEYWORDS = {
     barracks: ['cuartel', 'cuarteles', 'barracks'],
     stable: ['establo', 'estable', 'stable'],
     workshop: ['taller', 'taller de asedio', 'workshop'],
-    residence: ['residencia', 'palacio', 'residence', 'palace']
+    residence: ['residencia', 'palacio', 'residence', 'palace'],
+    rallyPoint: ['plaza de reuniones', 'plaza de reunion', 'rally point', 'assembly point']
 };
 const BUILDING_GIDS = {
     barracks: [19],
     stable: [20],
     workshop: [21],
-    residence: [25, 26]
+    residence: [25, 26],
+    rallyPoint: [16]
 };
 
 class GameClient {
@@ -960,6 +962,673 @@ class GameClient {
 
     async screenshot(filename) {
         if (this.page && !this.page.isClosed()) await this.page.screenshot({ path: filename });
+    }
+
+    async getCurrentVillageCoordinates(options = {}) {
+        if (this.page.isClosed()) return null;
+
+        if (typeof options.x === 'number' && typeof options.y === 'number') {
+            return { x: options.x, y: options.y, source: 'options' };
+        }
+
+        const envX = process.env.FARM_CENTER_X;
+        const envY = process.env.FARM_CENTER_Y;
+        if (envX && envY && !Number.isNaN(parseInt(envX, 10)) && !Number.isNaN(parseInt(envY, 10))) {
+            return { x: parseInt(envX, 10), y: parseInt(envY, 10), source: 'env' };
+        }
+
+        await this.page.goto(`${process.env.GAME_URL}/karte.php`, { waitUntil: 'domcontentloaded' });
+        await humanDelay(this.page, 1200, 2000);
+
+        const coords = await this.page.evaluate(() => {
+            const tryParsePair = (text) => {
+                if (!text) return null;
+                const m = String(text).match(/\((-?\d+)\s*\|\s*(-?\d+)\)/);
+                if (m) return { x: parseInt(m[1], 10), y: parseInt(m[2], 10) };
+                return null;
+            };
+
+            const xInput = document.querySelector('#xCoord, input[name="xCoord"], input[name="x"], input[name="xcoord"], input[id*="xCoord"]');
+            const yInput = document.querySelector('#yCoord, input[name="yCoord"], input[name="y"], input[name="ycoord"], input[id*="yCoord"]');
+
+            if (xInput && yInput) {
+                const x = parseInt(xInput.value, 10);
+                const y = parseInt(yInput.value, 10);
+                if (!Number.isNaN(x) && !Number.isNaN(y)) return { x, y };
+            }
+
+            const header = document.querySelector('#map') || document.querySelector('#content') || document.body;
+            const fromHeader = tryParsePair(header && header.innerText);
+            if (fromHeader) return fromHeader;
+
+            return tryParsePair(document.body && document.body.innerText);
+        });
+
+        if (!coords || Number.isNaN(coords.x) || Number.isNaN(coords.y)) {
+            throw new Error('No se pudieron detectar las coordenadas de la aldea. Define FARM_CENTER_X y FARM_CENTER_Y en .env.');
+        }
+
+        return { x: coords.x, y: coords.y, source: 'map' };
+    }
+
+    _generateCoordsInRadius(centerX, centerY, maxDistance) {
+        const coords = [];
+        const d = Math.max(0, Math.floor(maxDistance));
+        for (let dx = -d; dx <= d; dx++) {
+            for (let dy = -d; dy <= d; dy++) {
+                const dist = Math.sqrt(dx * dx + dy * dy);
+                if (dist === 0) continue;
+                if (dist > maxDistance) continue;
+                coords.push({ x: centerX + dx, y: centerY + dy, dist });
+            }
+        }
+        coords.sort((a, b) => a.dist - b.dist);
+        return coords;
+    }
+
+    async _getMapTileVillageInfo(x, y) {
+        if (this.page.isClosed()) return null;
+
+        await this.page.goto(`${process.env.GAME_URL}/karte.php?x=${x}&y=${y}`, { waitUntil: 'domcontentloaded' });
+        await humanDelay(this.page, 900, 1500);
+
+        return await this.page.evaluate(() => {
+            const normalize = (txt) => (txt || '')
+                .toLowerCase()
+                .normalize('NFD')
+                .replace(/[\u0300-\u036f]/g, ' ')
+                .replace(/\s+/g, ' ')
+                .trim();
+
+            const detailsEl =
+                document.querySelector('#tileDetails') ||
+                document.querySelector('#mapDetails') ||
+                document.querySelector('.tileDetails') ||
+                document.querySelector('.mapDetails') ||
+                document.querySelector('#content') ||
+                document.body;
+
+            const detailsText = normalize(detailsEl ? detailsEl.innerText : document.body.innerText);
+
+            const isOasis = detailsText.includes('oasis');
+            const looksLikeVillage =
+                detailsText.includes('aldea') ||
+                detailsText.includes('village') ||
+                detailsText.includes('pueblo') ||
+                detailsText.includes('habitantes') ||
+                detailsText.includes('population') ||
+                detailsText.includes('inhabitants');
+
+            if (!looksLikeVillage || isOasis) return null;
+
+            const popMatch =
+                detailsText.match(/habitantes\s*[:\-]?\s*(\d{1,6})/) ||
+                detailsText.match(/population\s*[:\-]?\s*(\d{1,6})/) ||
+                detailsText.match(/inhabitants\s*[:\-]?\s*(\d{1,6})/);
+
+            const population = popMatch ? parseInt(popMatch[1], 10) : null;
+            if (population === null || Number.isNaN(population)) return null;
+
+            const titleEl =
+                document.querySelector('#tileDetails h1, #tileDetails .title, #mapDetails h1, h1, .titleInHeader') ||
+                null;
+            const rawTitle = titleEl ? (titleEl.textContent || '').trim() : '';
+
+            // Intentar extraer "Nombre" de: "Vesnice: Gregi (Capital) (-75|71)"
+            let name = rawTitle;
+            const labelMatch = name.match(/^\s*(vesnice|aldea|village)\s*:\s*(.+)$/i);
+            if (labelMatch) name = labelMatch[2];
+            name = name.replace(/\(\s*-?\d+\s*\|\s*-?\d+\s*\)\s*$/g, '').trim();
+            // Quitar sufijos tipo "(Capital)" dejando el nombre base
+            name = name.replace(/\([^)]*\)\s*$/g, '').trim();
+            if (!name) name = null;
+
+            return { population, name };
+        });
+    }
+
+    async addToFarmListFromMap(x, y, listName) {
+        if (this.page.isClosed()) return false;
+
+        // Estamos ya en el detalle del mapa (karte.php?x=...&y=...)
+        const clicked = await this.page.evaluate(() => {
+            const normalize = (txt) => (txt || '')
+                .toLowerCase()
+                .normalize('NFD')
+                .replace(/[\u0300-\u036f]/g, '')
+                .trim();
+
+            const wanted = ['agregar a la lista de vacas', 'add to farm list', 'add to farmlist'];
+            const links = Array.from(document.querySelectorAll('a, button'));
+            for (const el of links) {
+                const t = normalize(el.textContent || el.innerText || el.value);
+                if (!t) continue;
+                if (wanted.some(w => t.includes(normalize(w)))) {
+                    el.click();
+                    return true;
+                }
+            }
+            return false;
+        });
+
+        if (!clicked) return false;
+
+        await humanDelay(this.page, 900, 1500);
+
+        // En algunos servidores aparece un mini-form para elegir lista; lo intentamos de forma genérica.
+        const selected = await this.page.evaluate((rawListName) => {
+            const normalize = (txt) => (txt || '')
+                .toLowerCase()
+                .normalize('NFD')
+                .replace(/[\u0300-\u036f]/g, '')
+                .replace(/\s+/g, ' ')
+                .trim();
+
+            const listName = normalize(rawListName);
+            const selects = Array.from(document.querySelectorAll('select'));
+            for (const sel of selects) {
+                const options = Array.from(sel.querySelectorAll('option'));
+                const match = options.find(o => normalize(o.textContent || '') === listName || normalize(o.textContent || '').includes(listName));
+                if (match) {
+                    sel.value = match.value;
+                    sel.dispatchEvent(new Event('change', { bubbles: true }));
+                    return true;
+                }
+            }
+            return false;
+        }, listName);
+
+        if (selected) await humanDelay(this.page, 400, 900);
+
+        const confirmed = await this.page.evaluate(() => {
+            const normalize = (txt) => (txt || '')
+                .toLowerCase()
+                .normalize('NFD')
+                .replace(/[\u0300-\u036f]/g, '')
+                .trim();
+
+            const wanted = ['agregar', 'anadir', 'añadir', 'ok', 'aceptar', 'guardar', 'save'];
+            const candidates = Array.from(document.querySelectorAll('button, input[type="submit"]'));
+            for (const el of candidates) {
+                const t = normalize(el.textContent || el.innerText || el.value);
+                if (!t) continue;
+                if (wanted.some(w => t === normalize(w) || t.includes(normalize(w)))) {
+                    el.click();
+                    return true;
+                }
+            }
+            return false;
+        });
+
+        if (confirmed) await humanDelay(this.page, 900, 1500);
+        return true;
+    }
+
+    async findRallyPointSlot(explicitSlot) {
+        return await this.findBuildingSlot('rallyPoint', explicitSlot);
+    }
+
+    async openFarmList(listName, options = {}) {
+        if (this.page.isClosed()) return false;
+        const rallySlot = await this.findRallyPointSlot(options.rallySlot);
+        if (!rallySlot) throw new Error('No se pudo localizar la Plaza de reuniones (rally point).');
+
+        await this.page.goto(`${process.env.GAME_URL}/build.php?id=${rallySlot}`, { waitUntil: 'domcontentloaded' });
+        await humanDelay(this.page, 1200, 2000);
+
+        const openedTab = await this.page.evaluate(() => {
+            const normalize = (txt) => (txt || '')
+                .toLowerCase()
+                .normalize('NFD')
+                .replace(/[\u0300-\u036f]/g, '')
+                .trim();
+
+            const wanted = ['lista de vacas', 'farm list', 'raid list'];
+            const candidates = Array.from(document.querySelectorAll('a, button'));
+            for (const el of candidates) {
+                const t = normalize(el.textContent || el.innerText || el.value);
+                if (wanted.some(w => t.includes(normalize(w)))) {
+                    el.click();
+                    return true;
+                }
+            }
+            return false;
+        });
+
+        if (!openedTab) {
+            logger.warn('No se pudo abrir la pestaña de "Lista de vacas" por texto. Continuando igualmente...');
+        }
+
+        await humanDelay(this.page, 1200, 2000);
+
+        const selectedList = await this.page.evaluate((rawName) => {
+            const normalize = (txt) => (txt || '')
+                .toLowerCase()
+                .normalize('NFD')
+                .replace(/[\u0300-\u036f]/g, '')
+                .replace(/\s+/g, ' ')
+                .trim();
+
+            const wanted = normalize(rawName);
+            const listCandidates = Array.from(document.querySelectorAll('a, button, .raidList, .listEntry, .listTitle, .name'));
+
+            for (const el of listCandidates) {
+                const t = normalize(el.textContent || el.innerText || '');
+                if (!t) continue;
+                if (t === wanted || t.includes(wanted)) {
+                    el.click();
+                    return true;
+                }
+            }
+            return false;
+        }, listName);
+
+        if (!selectedList) {
+            logger.warn(`No se pudo seleccionar la lista "${listName}" por texto. Si ya está abierta, esto es normal.`);
+        } else {
+            await humanDelay(this.page, 800, 1400);
+        }
+
+        return true;
+    }
+
+    async startAllFarmLists(options = {}) {
+        if (this.page.isClosed()) return false;
+        const rallySlot = await this.findRallyPointSlot(options.rallySlot);
+        if (!rallySlot) throw new Error('No se pudo localizar la Plaza de reuniones (rally point).');
+
+        await this.page.goto(`${process.env.GAME_URL}/build.php?id=${rallySlot}`, { waitUntil: 'domcontentloaded' });
+        await humanDelay(this.page, 1200, 2000);
+
+        // Asegurar pestaña "Lista de vacas"
+        await this.page.evaluate(() => {
+            const normalize = (txt) => (txt || '')
+                .toLowerCase()
+                .normalize('NFD')
+                .replace(/[\u0300-\u036f]/g, '')
+                .trim();
+
+            const wanted = ['lista de vacas', 'farm list', 'raid list'];
+            const candidates = Array.from(document.querySelectorAll('a, button'));
+            for (const el of candidates) {
+                const t = normalize(el.textContent || el.innerText || el.value);
+                if (wanted.some(w => t.includes(normalize(w)))) {
+                    el.click();
+                    return;
+                }
+            }
+        });
+        await humanDelay(this.page, 900, 1500);
+
+        const clicked = await this.page.evaluate(() => {
+            const normalize = (txt) => (txt || '')
+                .toLowerCase()
+                .normalize('NFD')
+                .replace(/[\u0300-\u036f]/g, '')
+                .replace(/\s+/g, ' ')
+                .trim();
+
+            const wanted = [
+                'comenzar todas las listas de vacas',
+                'comenzar todas las listas',
+                'start all farm lists',
+                'start all raid lists'
+            ];
+
+            const candidates = Array.from(document.querySelectorAll('button, a, input[type="submit"]'));
+            for (const el of candidates) {
+                const t = normalize(el.textContent || el.innerText || el.value);
+                if (!t) continue;
+                if (!wanted.some(w => t.includes(normalize(w)))) continue;
+
+                // Preferir el botón verde si existe
+                const classText = normalize(el.className || '');
+                const isGreen = classText.includes('green') || classText.includes('start') || classText.includes('go');
+                if (isGreen || el.tagName.toLowerCase() === 'button') {
+                    el.click();
+                    return true;
+                }
+            }
+
+            // Fallback: botón verde genérico que contiene "comenzar"
+            const greenButtons = Array.from(document.querySelectorAll('button.green, .green button, a.green, .green a'));
+            for (const el of greenButtons) {
+                const t = normalize(el.textContent || el.innerText || el.value);
+                if (t.includes('comenzar') || t.includes('start')) {
+                    el.click();
+                    return true;
+                }
+            }
+
+            return false;
+        });
+
+        if (clicked) {
+            await humanDelay(this.page, 1200, 2000);
+            return true;
+        }
+
+        return false;
+    }
+
+    async getFarmListTargets() {
+        if (this.page.isClosed()) return [];
+
+        return await this.page.evaluate(() => {
+            const uniq = new Set();
+            const targets = [];
+
+            const extractPair = (text) => {
+                if (!text) return null;
+                const m = String(text).match(/\((-?\d+)\s*\|\s*(-?\d+)\)/) || String(text).match(/(^|\s)(-?\d+)\s*\|\s*(-?\d+)(\s|$)/);
+                if (!m) return null;
+                const x = parseInt(m[m.length - 3], 10);
+                const y = parseInt(m[m.length - 2], 10);
+                if (Number.isNaN(x) || Number.isNaN(y)) return null;
+                return { x, y };
+            };
+
+            const rowCandidates = Array.from(document.querySelectorAll('tr, .raidListEntry, .farmListEntry, .slotRow'));
+            for (const row of rowCandidates) {
+                const pair = extractPair(row.innerText);
+                if (!pair) continue;
+                const key = `${pair.x}|${pair.y}`;
+                if (uniq.has(key)) continue;
+                uniq.add(key);
+                targets.push(pair);
+            }
+            return targets;
+        });
+    }
+
+    async addFarmListTarget(x, y, options = {}) {
+        if (this.page.isClosed()) return false;
+
+        const clicked = await this.page.evaluate(() => {
+            const normalize = (txt) => (txt || '')
+                .toLowerCase()
+                .normalize('NFD')
+                .replace(/[\u0300-\u036f]/g, '')
+                .trim();
+
+            const wanted = ['anadir objetivo', 'añadir objetivo', 'add target', 'nuevo objetivo'];
+            const candidates = Array.from(document.querySelectorAll('a, button'));
+            for (const el of candidates) {
+                const t = normalize(el.textContent || el.innerText || el.value);
+                if (wanted.some(w => t.includes(normalize(w)))) {
+                    el.click();
+                    return true;
+                }
+            }
+            return false;
+        });
+
+        if (!clicked) {
+            throw new Error('No se encontró el botón "Añadir objetivo" en la lista de vacas.');
+        }
+
+        await humanDelay(this.page, 800, 1400);
+
+        const filled = await this.page.evaluate(({ x, y, name }) => {
+            const xInput =
+                document.querySelector('#xCoord, input[name="xCoord"], input[name="x"], input[name="xcoord"], input[id*="xCoord"]') ||
+                document.querySelector('input[placeholder*="x" i]');
+            const yInput =
+                document.querySelector('#yCoord, input[name="yCoord"], input[name="y"], input[name="ycoord"], input[id*="yCoord"]') ||
+                document.querySelector('input[placeholder*="y" i]');
+
+            if (!xInput || !yInput) return false;
+            xInput.focus();
+            xInput.value = String(x);
+            xInput.dispatchEvent(new Event('input', { bubbles: true }));
+            xInput.dispatchEvent(new Event('change', { bubbles: true }));
+
+            yInput.focus();
+            yInput.value = String(y);
+            yInput.dispatchEvent(new Event('input', { bubbles: true }));
+            yInput.dispatchEvent(new Event('change', { bubbles: true }));
+
+            if (name) {
+                const nameInput =
+                    document.querySelector('input[name*="name" i], input[id*="name" i]') ||
+                    document.querySelector('input[placeholder*="nombre" i], input[placeholder*="name" i]');
+                if (nameInput) {
+                    nameInput.focus();
+                    nameInput.value = String(name);
+                    nameInput.dispatchEvent(new Event('input', { bubbles: true }));
+                    nameInput.dispatchEvent(new Event('change', { bubbles: true }));
+                }
+            }
+
+            return true;
+        }, { x, y, name: options.name || null });
+
+        if (!filled) {
+            throw new Error('No se encontraron inputs X/Y al añadir objetivo.');
+        }
+
+        await humanDelay(this.page, 400, 900);
+
+        const confirmed = await this.page.evaluate(() => {
+            const normalize = (txt) => (txt || '')
+                .toLowerCase()
+                .normalize('NFD')
+                .replace(/[\u0300-\u036f]/g, '')
+                .trim();
+
+            const wanted = ['anadir', 'añadir', 'agregar', 'ok', 'aceptar', 'guardar', 'save'];
+            const candidates = Array.from(document.querySelectorAll('button, input[type="submit"], a'));
+            for (const el of candidates) {
+                const t = normalize(el.textContent || el.innerText || el.value);
+                if (wanted.some(w => t === normalize(w) || t.includes(normalize(w)))) {
+                    el.click();
+                    return true;
+                }
+            }
+            return false;
+        });
+
+        if (!confirmed) {
+            logger.warn('No se encontró botón de confirmación al añadir objetivo; puede que se guarde automáticamente.');
+        }
+
+        await humanDelay(this.page, 1000, 1600);
+        return true;
+    }
+
+    async setFarmListTroopsForTarget(x, y, troopCounts) {
+        if (this.page.isClosed()) return false;
+        const clubCount = troopCounts && typeof troopCounts.t1 === 'number' ? troopCounts.t1 : null;
+        if (clubCount === null) return false;
+
+        const updated = await this.page.evaluate(({ x, y, clubCount }) => {
+            const coordNeedleA = `(${x}|${y})`;
+            const coordNeedleB = `${x}|${y}`;
+
+            const rows = Array.from(document.querySelectorAll('tr, .raidListEntry, .farmListEntry, .slotRow'));
+
+            const fireInputEvents = (input) => {
+                input.dispatchEvent(new Event('input', { bubbles: true }));
+                input.dispatchEvent(new Event('change', { bubbles: true }));
+                input.dispatchEvent(new Event('blur', { bubbles: true }));
+            };
+
+            for (const row of rows) {
+                const text = row.innerText || '';
+                if (!text.includes(coordNeedleA) && !text.includes(coordNeedleB)) continue;
+
+                const input =
+                    row.querySelector('input[name*="t1"]') ||
+                    row.querySelector('input[name*="troops[1]"]') ||
+                    row.querySelector('input[data-unit="1"]') ||
+                    row.querySelector('input[class*="u1"]') ||
+                    row.querySelector('input');
+
+                if (!input) return false;
+                input.focus();
+                input.value = String(clubCount);
+                fireInputEvents(input);
+                return true;
+            }
+            return false;
+        }, { x, y, clubCount });
+
+        if (!updated) {
+            logger.warn(`No se pudo configurar tropas para objetivo (${x}|${y}).`);
+            return false;
+        }
+
+        await humanDelay(this.page, 250, 600);
+        return true;
+    }
+
+    async setFarmListTroopsForAllTargets(troopCounts) {
+        if (this.page.isClosed()) return 0;
+        const clubCount = troopCounts && typeof troopCounts.t1 === 'number' ? troopCounts.t1 : null;
+        if (clubCount === null) return 0;
+
+        const changed = await this.page.evaluate(({ clubCount }) => {
+            const rows = Array.from(document.querySelectorAll('tr, .raidListEntry, .farmListEntry, .slotRow'));
+            let updated = 0;
+
+            const fireInputEvents = (input) => {
+                input.dispatchEvent(new Event('input', { bubbles: true }));
+                input.dispatchEvent(new Event('change', { bubbles: true }));
+                input.dispatchEvent(new Event('blur', { bubbles: true }));
+            };
+
+            for (const row of rows) {
+                const input =
+                    row.querySelector('input[name*="t1"]') ||
+                    row.querySelector('input[name*="troops[1]"]') ||
+                    row.querySelector('input[data-unit="1"]') ||
+                    row.querySelector('input[class*="u1"]');
+
+                if (!input) continue;
+                if (String(input.value || '').trim() === String(clubCount)) continue;
+                input.focus();
+                input.value = String(clubCount);
+                fireInputEvents(input);
+                updated += 1;
+            }
+
+            return updated;
+        }, { clubCount });
+
+        if (changed > 0) await humanDelay(this.page, 400, 900);
+        return changed;
+    }
+
+    async saveFarmListIfNeeded() {
+        if (this.page.isClosed()) return false;
+
+        const clicked = await this.page.evaluate(() => {
+            const normalize = (txt) => (txt || '')
+                .toLowerCase()
+                .normalize('NFD')
+                .replace(/[\u0300-\u036f]/g, '')
+                .trim();
+
+            const wanted = ['guardar', 'save'];
+            const candidates = Array.from(document.querySelectorAll('button, input[type="submit"]'));
+            for (const el of candidates) {
+                const t = normalize(el.textContent || el.innerText || el.value);
+                if (wanted.some(w => t === normalize(w) || t.includes(normalize(w)))) {
+                    el.click();
+                    return true;
+                }
+            }
+            return false;
+        });
+
+        if (clicked) {
+            await humanDelay(this.page, 1200, 1800);
+        }
+        return clicked;
+    }
+
+    async updateFarmListFromNearbyVillages(options = {}) {
+        const listName = options.listName || 'raid';
+        const maxPopulation = typeof options.maxPopulation === 'number' ? options.maxPopulation : 50;
+        const maxDistance = typeof options.maxDistance === 'number' ? options.maxDistance : 20;
+        const troopCounts = options.troopCounts || { t1: 2 };
+        const maxTargets = typeof options.maxTargets === 'number' ? options.maxTargets : 100;
+        const applyTroopsToExisting = options.applyTroopsToExisting !== false;
+        const addMethod = options.addMethod || 'map';
+
+        const center = await this.getCurrentVillageCoordinates({ x: options.centerX, y: options.centerY });
+        logger.info(`Centro de busqueda: (${center.x}|${center.y}) [${center.source}]`);
+
+        await this.openFarmList(listName, { rallySlot: options.rallySlot });
+        if (applyTroopsToExisting) {
+            const changed = await this.setFarmListTroopsForAllTargets(troopCounts);
+            if (changed > 0) logger.info(`Tropas aplicadas a objetivos existentes: ${changed}`);
+        }
+
+        const existing = await this.getFarmListTargets();
+        const existingSet = new Set(existing.map(t => `${t.x}|${t.y}`));
+        logger.info(`Objetivos actuales en lista "${listName}": ${existing.length}`);
+
+        const coordList = this._generateCoordsInRadius(center.x, center.y, maxDistance);
+        const added = [];
+
+        for (const c of coordList) {
+            if (added.length >= maxTargets) break;
+            const key = `${c.x}|${c.y}`;
+            if (existingSet.has(key)) continue;
+
+            let info = null;
+            try {
+                info = await this._getMapTileVillageInfo(c.x, c.y);
+            } catch (e) {
+                logger.warn(`Error leyendo mapa en (${c.x}|${c.y}): ${e.message}`);
+                continue;
+            }
+
+            if (!info) continue;
+            if (typeof info.population !== 'number') continue;
+            if (info.population >= maxPopulation) continue;
+
+            logger.info(`Anadiendo objetivo (${c.x}|${c.y}) hab=${info.population} dist=${c.dist.toFixed(1)}`);
+
+            try {
+                let addedOk = false;
+
+                if (addMethod === 'map') {
+                    // Ya estamos en el mapa por _getMapTileVillageInfo
+                    addedOk = await this.addToFarmListFromMap(c.x, c.y, listName);
+                }
+
+                // Fallback: añadir desde la farmlist, pero con nombre si está disponible
+                if (!addedOk) {
+                    await this.openFarmList(listName, { rallySlot: options.rallySlot });
+                    await this.addFarmListTarget(c.x, c.y, { name: info.name || undefined });
+                    addedOk = true;
+                }
+
+                if (!addedOk) throw new Error('No se pudo agregar a la lista.');
+                existingSet.add(key);
+                added.push({ x: c.x, y: c.y, population: info.population, dist: c.dist });
+            } catch (e) {
+                logger.warn(`No se pudo anadir (${c.x}|${c.y}): ${e.message}`);
+            }
+        }
+
+        // Reaplicar tropas a todos los objetivos (incluye los nuevos) y guardar
+        await this.openFarmList(listName, { rallySlot: options.rallySlot });
+        await this.setFarmListTroopsForAllTargets(troopCounts);
+        await this.saveFarmListIfNeeded();
+
+        return {
+            center,
+            listName,
+            addedCount: added.length,
+            added,
+            maxPopulation,
+            maxDistance,
+            troopCounts,
+            maxTargets
+        };
     }
 
     async close() {

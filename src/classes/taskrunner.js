@@ -12,6 +12,8 @@ const OASIS_RAID_TARGETS = [
     { x: -70, y: 70 }
 ];
 const OASIS_RAID_INTERVAL_MS = 15 * 60 * 1000;
+const FARM_LIST_MIN_INTERVAL_MS = 20 * 60 * 1000;
+const FARM_LIST_MAX_INTERVAL_MS = 40 * 60 * 1000;
 
 class TaskRunner {
     constructor() {
@@ -21,6 +23,18 @@ class TaskRunner {
         this.account = null;
         this.cycleCount = 0;
         this.lastOasisRaid = 0;
+        this.nextFarmListRunAt = 0;
+    }
+
+    getFarmListIntervalMs() {
+        const minMinutes = parseInt(process.env.FARM_LAUNCH_MIN_MINUTES || '20', 10);
+        const maxMinutes = parseInt(process.env.FARM_LAUNCH_MAX_MINUTES || '40', 10);
+        const minMs = (Number.isNaN(minMinutes) ? 20 : minMinutes) * 60 * 1000;
+        const maxMs = (Number.isNaN(maxMinutes) ? 40 : maxMinutes) * 60 * 1000;
+
+        if (minMs <= 0 || maxMs <= 0) return { minMs: FARM_LIST_MIN_INTERVAL_MS, maxMs: FARM_LIST_MAX_INTERVAL_MS };
+        if (maxMs < minMs) return { minMs: maxMs, maxMs: minMs };
+        return { minMs, maxMs };
     }
 
     async start() {
@@ -45,6 +59,11 @@ class TaskRunner {
             
             this.isRunning = true;
             logger.success('=== BOT INICIADO ===');
+
+            // Programar primer lanzamiento con intervalo aleatorio (20-40 min)
+            const { minMs, maxMs } = this.getFarmListIntervalMs();
+            this.nextFarmListRunAt = Date.now() + randomInterval(minMs, maxMs);
+
             await this.loop();
         } catch (error) {
             if (!this.isClosedError(error)) {
@@ -69,6 +88,9 @@ class TaskRunner {
 
                 // Revisa aventuras en cada ciclo (sin filtrar por salud)
                 await this.client.checkAndStartAdventure();
+
+                // Lanzar listas de vacas con intervalo aleatorio (20-40 min)
+                await this.maybeLaunchFarmLists();
 
                 if (this.cycleCount % 50 === 0) {
                     logger.info('Re-escaneo periodico...');
@@ -175,6 +197,32 @@ class TaskRunner {
             }
         } catch (error) {
             logger.warn('Error en el chequeo de oasis: ' + error.message);
+        }
+    }
+
+    async maybeLaunchFarmLists() {
+        const now = Date.now();
+        if (!this.nextFarmListRunAt || now < this.nextFarmListRunAt) return;
+
+        const { minMs, maxMs } = this.getFarmListIntervalMs();
+        const nextDelay = randomInterval(minMs, maxMs);
+        this.nextFarmListRunAt = now + nextDelay;
+
+        logger.info(`Lanzando listas de vacas... (proximo en ${(nextDelay / 60000).toFixed(1)} min)`);
+
+        try {
+            const rallySlot = process.env.FARM_RALLY_SLOT ? parseInt(process.env.FARM_RALLY_SLOT, 10) : undefined;
+            const clicked = await this.client.startAllFarmLists({ rallySlot });
+
+            if (clicked) {
+                logger.success('Listas de vacas lanzadas.');
+            } else {
+                logger.warn('No se encontro el boton "Comenzar todas las listas de vacas".');
+            }
+        } catch (error) {
+            logger.warn('Error lanzando listas de vacas: ' + error.message);
+            // Reintentar pronto si hubo un fallo de UI/navegacion
+            this.nextFarmListRunAt = Date.now() + randomInterval(2 * 60 * 1000, 5 * 60 * 1000);
         }
     }
 

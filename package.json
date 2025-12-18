@@ -10,7 +10,8 @@
     "add-training": "node src/scripts/addTraining.js",
     "scan": "node src/scripts/scanVillage.js",
     "test-connection": "node src/scripts/testConnection.js",
-    "status": "node src/scripts/status.js"
+    "status": "node src/scripts/status.js",
+    "farm-setup": "node src/scripts/updateFarmList.js"
   },
   "keywords": [],
   "author": "",
