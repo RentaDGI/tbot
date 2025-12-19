@@ -110,29 +110,56 @@ class TaskRunner {
                 logger.info('Tareas: ' + buildTasks.length + ' construccion, ' + trainingTasks.length + ' entrenamiento');
 
                 let buildResult = { success: false, reason: 'no_tasks' };
-                
+
                 if (buildTasks.length > 0) {
-                    const activeVillageId = (buildTasks[0].village_id || 'main');
-                    await this.client.switchToVillage(activeVillageId);
-
-                    const buildTasksForVillage = buildTasks.filter(t => (t.village_id || 'main') === activeVillageId);
-                    if (buildTasksForVillage.length !== buildTasks.length) {
-                        logger.info('Construccion: procesando aldea ' + activeVillageId + ' (' + buildTasksForVillage.length + '/' + buildTasks.length + ' tareas)');
+                    // Agrupar tareas por aldea
+                    const tasksByVillage = {};
+                    for (const task of buildTasks) {
+                        const villageId = task.village_id || 'main';
+                        if (!tasksByVillage[villageId]) {
+                            tasksByVillage[villageId] = [];
+                        }
+                        tasksByVillage[villageId].push(task);
                     }
 
-                    const completedTasks = this.client.getCompletedResourceTasks(buildTasksForVillage);
-                    for (const task of completedTasks) {
-                        logger.success('Construccion completada: ' + task.building_name);
-                        await this.completeBuildTask(task.id);
-                    }
+                    const villageIds = Object.keys(tasksByVillage);
+                    logger.info('Construccion: procesando ' + villageIds.length + ' aldea(s) con ' + buildTasks.length + ' tarea(s) total');
 
-                    const remainingBuild = buildTasksForVillage.filter(function(t) {
-                        return !completedTasks.find(function(ct) { return ct.id === t.id; });
-                    });
+                    // Procesar cada aldea
+                    for (const villageId of villageIds) {
+                        const buildTasksForVillage = tasksByVillage[villageId];
+                        logger.info('Procesando aldea ' + villageId + ' (' + buildTasksForVillage.length + ' tarea(s))');
 
-                    if (remainingBuild.length > 0) {
-                        const { sortedTasks, resourceAmounts } = await this.reorderResourceTasks(remainingBuild);
-                        buildResult = await this.handleBuildWithCache(sortedTasks, resourceAmounts);
+                        const switched = await this.client.switchToVillage(villageId);
+                        if (!switched) {
+                            logger.warn('No se pudo cambiar a la aldea ' + villageId + '. Saltando sus tareas.');
+                            continue;
+                        }
+
+                        const completedTasks = this.client.getCompletedResourceTasks(buildTasksForVillage);
+                        for (const task of completedTasks) {
+                            logger.success('Construccion completada: ' + task.building_name);
+                            await this.completeBuildTask(task.id);
+                        }
+
+                        const remainingBuild = buildTasksForVillage.filter(function(t) {
+                            return !completedTasks.find(function(ct) { return ct.id === t.id; });
+                        });
+
+                        if (remainingBuild.length > 0) {
+                            const { sortedTasks, resourceAmounts } = await this.reorderResourceTasks(remainingBuild);
+                            const result = await this.handleBuildWithCache(sortedTasks, resourceAmounts);
+
+                            // Actualizar buildResult solo si hubo éxito o si es el primer resultado
+                            if (result.success || buildResult.reason === 'no_tasks') {
+                                buildResult = result;
+                            }
+
+                            // Si hubo éxito, continuar con la siguiente aldea en el próximo ciclo
+                            if (result.success) {
+                                break;
+                            }
+                        }
                     }
                 }
 

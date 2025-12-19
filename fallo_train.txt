@@ -1,0 +1,5 @@
+ℹ️  [02:52:16] Procesando entrenamiento: Luchador de Porra
+ℹ️  [02:52:17] Edificio "barracks" localizado en slot 34.
+⚠️  [02:52:24] Entrenamiento no reflejado en cola: antes=27 despues=27 esperado>=32
+⚠️  [02:52:24] Entrenamiento no ejecutado {"reason":"training_not_applied"}
+ℹ️  [02:52:24] Revisando tareas en breve. Esperando 40.0s...

@@ -64,6 +64,10 @@ async function main() {
         return;
     }
 
+    const initialVillageIdInput = await question('Village id (newdid) [main]: ');
+    const defaultVillageId = normalizeVillageId(initialVillageIdInput);
+    console.log(`Usando aldea: ${defaultVillageId}`);
+
     await showCurrentTasks(account.id);
 
     while (true) {
@@ -78,10 +82,10 @@ async function main() {
 
         switch (choice.trim()) {
             case '1':
-                await addResourceTask(account.id);
+                await addResourceTask(account.id, defaultVillageId);
                 break;
             case '2':
-                await addBuildingTask(account.id, account.village_scan);
+                await addBuildingTask(account.id, account.village_scan, defaultVillageId);
                 break;
             case '3':
                 await showCurrentTasks(account.id);
@@ -99,7 +103,7 @@ async function main() {
     }
 }
 
-async function addResourceTask(accountId) {
+async function addResourceTask(accountId, villageId) {
     console.log('\n═══════════════════════════════════════════');
     console.log('   🌾 TAREAS DE RECURSOS');
     console.log('═══════════════════════════════════════════\n');
@@ -123,8 +127,7 @@ async function addResourceTask(accountId) {
 
     const priority = await question('¿Prioridad? (1-10) [10]: ');
     const prio = parseInt(priority) || 10;
-    const villageIdInput = await question('Village id (newdid) [main]: ');
-    const villageId = normalizeVillageId(villageIdInput);
+    const targetVillageId = normalizeVillageId(villageId);
 
     const tasks = [];
 
@@ -134,7 +137,7 @@ async function addResourceTask(accountId) {
         Object.values(RESOURCE_TYPES).forEach(resource => {
             tasks.push({
                 account_id: accountId,
-                village_id: villageId,
+                village_id: targetVillageId,
                 building_type: resource.type,
                 building_name: resource.name,
                 target_level: level,
@@ -147,7 +150,7 @@ async function addResourceTask(accountId) {
         const resource = RESOURCE_TYPES[typeChoice];
         tasks.push({
             account_id: accountId,
-            village_id: villageId,
+            village_id: targetVillageId,
             building_type: resource.type,
             building_name: resource.name,
             target_level: level,
@@ -168,7 +171,7 @@ async function addResourceTask(accountId) {
     }
 }
 
-async function addBuildingTask(accountId, villageScan) {
+async function addBuildingTask(accountId, villageScan, villageId) {
     console.log('\n═══════════════════════════════════════════');
     console.log('   🏛️  SUBIR EDIFICIO');
     console.log('═══════════════════════════════════════════\n');
@@ -221,12 +224,11 @@ async function addBuildingTask(accountId, villageScan) {
     const targetLevel = parseInt(await question('¿Hasta qué nivel?: '));
     const prio = parseInt(await question('¿Prioridad? (1-10) [5]: ') || 5);
 
-    const villageIdInput = await question('Village id (newdid) [main]: ');
-    const villageId = normalizeVillageId(villageIdInput);
+    const targetVillageId = normalizeVillageId(villageId);
 
     const { error } = await supabase.from('build_queue').insert({
         account_id: accountId,
-        village_id: villageId,
+        village_id: targetVillageId,
         building_slot: slot,
         building_name: buildingName || 'Edificio',
         target_level: targetLevel,

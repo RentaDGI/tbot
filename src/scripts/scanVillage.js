@@ -101,13 +101,11 @@ async function scanVillage() {
 
                 const info = await page.evaluate(() => {
                     const titleEl = document.querySelector('.titleInHeader, h1, .buildingTitle, .contentNavi h1');
-
-                    const isEmpty =
-                        !!document.querySelector('.g0, .aid0, .buildingWrapper.g0, .buildingWrapper.aid0, .constructionSite, .buildNewBuilding, .newBuilding') ||
-                        !!document.querySelector('a[href*="gid="]');
+                    const bodyClass = (document.body && document.body.className) ? String(document.body.className) : '';
+                    const isEmptyByBody = /\bgid0\b/i.test(bodyClass) || /\baid0\b/i.test(bodyClass);
 
                     if (!titleEl) {
-                        if (isEmpty) return { name: '[VACIO - Construir nuevo]', level: 0, empty: true };
+                        if (isEmptyByBody) return { name: '[VACIO - Construir nuevo]', level: 0, empty: true };
                         return null;
                     }
 
@@ -124,8 +122,13 @@ async function scanVillage() {
                         .replace(/\d+$/, '')
                         .trim();
 
-                    const lower = normalize(name);
-                    const looksEmpty = isEmpty || lower.includes('construir') || lower.includes('build new');
+                    const lower = (name || '')
+                        .toLowerCase()
+                        .normalize('NFD')
+                        .replace(/[\u0300-\u036f]/g, '')
+                        .replace(/\s+/g, ' ')
+                        .trim();
+                    const looksEmpty = isEmptyByBody || lower.includes('construir') || lower.includes('build new') || lower.includes('bauplatz');
                     if (looksEmpty) return { name: '[VACIO - Construir nuevo]', level: 0, empty: true };
 
                     return { name, level, empty: false };
@@ -166,4 +169,3 @@ async function scanVillage() {
 }
 
 scanVillage();
-

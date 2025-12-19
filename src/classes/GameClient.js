@@ -165,6 +165,11 @@ class GameClient {
                     const label = normalize(el.getAttribute('title') || el.getAttribute('alt') || el.textContent || '');
                     const classText = normalize(el.className || '');
                     const href = el.getAttribute('href') || '';
+
+                    // Importante: ignorar links de "construir nuevo edificio" que incluyen gid=
+                    // (ej: build.php?id=34&gid=19) porque NO son el edificio existente.
+                    if (href.includes('gid=')) continue;
+
                     const gidMatch = href.match(/gid=(\d+)/);
                     const gid = gidMatch ? parseInt(gidMatch[1], 10) : null;
 
@@ -435,7 +440,20 @@ class GameClient {
         const targetRaw = (villageIdOrName || '').toString().trim();
         if (!targetRaw || targetRaw.toLowerCase() === 'main') return true;
 
-        const clicked = await this.page.evaluate((target) => {
+        if (/^\d+$/.test(targetRaw)) {
+            const directUrl = `${process.env.GAME_URL}/dorf1.php?newdid=${targetRaw}`;
+            try {
+                await this.page.goto(directUrl, { waitUntil: 'domcontentloaded' });
+                await humanDelay(this.page, 1200, 2200);
+                this.invalidateCache();
+                return true;
+            } catch (error) {
+                logger.warn(`Error al cambiar de aldea (newdid=${targetRaw}): ${error.message}`);
+                return false;
+            }
+        }
+
+        const target = await this.page.evaluate((target) => {
             const normalize = (txt) => (txt || '')
                 .toLowerCase()
                 .normalize('NFD')
@@ -451,21 +469,19 @@ class GameClient {
             ));
 
             for (const a of links) {
-                const href = a.getAttribute('href') || '';
-                const m = href.match(/[?&]newdid=(\d+)/);
+                const hrefRaw = a.getAttribute('href') || '';
+                const m = hrefRaw.match(/[?&]newdid=(\d+)/);
                 if (!m) continue;
                 const id = m[1];
                 const name = normalize(a.textContent || a.innerText || '') || id;
 
                 if (wantedIsId) {
                     if (id === wanted) {
-                        a.click();
-                        return true;
+                        return { href: a.href || hrefRaw || '', id };
                     }
                 } else {
                     if (name && (name === wanted || name.includes(wanted))) {
-                        a.click();
-                        return true;
+                        return { href: a.href || hrefRaw || '', id };
                     }
                 }
             }
@@ -477,20 +493,36 @@ class GameClient {
                 if (!did && !name) continue;
 
                 if (wantedIsId && did && String(did) === wanted) {
-                    li.click();
-                    return true;
+                    return { href: '', id: String(did) };
                 }
                 if (!wantedIsId && name && (name === wanted || name.includes(wanted))) {
-                    li.click();
-                    return true;
+                    return { href: '', id: String(did || '') };
                 }
             }
 
-            return false;
+            return null;
         }, targetRaw);
 
-        if (!clicked) {
+        if (!target) {
             logger.warn(`No se pudo cambiar a la aldea "${targetRaw}" (usa village_id=newdid o nombre aproximado).`);
+            return false;
+        }
+
+        let url = (target.href || '').trim();
+        if (!url || url.toLowerCase().startsWith('javascript:')) {
+            if (!target.id) {
+                logger.warn(`No se pudo resolver la URL de la aldea "${targetRaw}".`);
+                return false;
+            }
+            url = `${process.env.GAME_URL}/dorf1.php?newdid=${target.id}`;
+        } else if (!/^https?:/i.test(url)) {
+            url = new URL(url, process.env.GAME_URL).toString();
+        }
+
+        try {
+            await this.page.goto(url, { waitUntil: 'domcontentloaded' });
+        } catch (error) {
+            logger.warn(`Error al cambiar de aldea a "${targetRaw}": ${error.message}`);
             return false;
         }
 
@@ -804,8 +836,9 @@ class GameClient {
             const upgradeKeywords = ['mejora', 'mejorar', 'upgrade', 'construir', 'ampliar', 'nivel', 'level', 'build'];
             const blacklist = ['prolong', 'proteger', 'protecc', 'protection', 'plus', 'premium', 'activar', 'comprar', 'confirmar', 'cancelar', 'aventura', 'mision', 'adventure', 'prorrogar'];
 
-            const collect = (root) => Array.from(root.querySelectorAll('button, input[type=\"submit\"], a.button'));
+            const collect = (root) => Array.from(root.querySelectorAll('button, input[type=\"submit\"], a, [role=\"button\"]'));
             const scopes = [
+                document.querySelector('.upgradeButtonsContainer'),
                 document.querySelector('.buildAction'),
                 document.querySelector('#contract'),
                 document.querySelector('.upgradeButtons'),
@@ -824,30 +857,54 @@ class GameClient {
                 }
             }
 
+            const extractActionUrl = (el) => {
+                if (!el) return null;
+                const href = el.getAttribute && el.getAttribute('href');
+                if (href && href.includes('action=build')) return href;
+                const onclick = el.getAttribute && el.getAttribute('onclick');
+                if (onclick && onclick.includes('action=build')) {
+                    const match = onclick.match(/(?:href|location\\.href)\\s*=\\s*'([^']+)'/i);
+                    if (match && match[1]) return match[1];
+                }
+                return null;
+            };
+
             for (const btn of candidates) {
                 const text = normalize(btn.innerText || btn.value || '');
                 const classes = normalize(btn.className || '');
 
                 if (btn.disabled || classes.includes('disabled')) continue;
+                if (btn.getAttribute && btn.getAttribute('aria-disabled') === 'true') continue;
                 if (classes.includes('gold')) continue;
                 if (blacklist.some(word => text.includes(word))) continue;
                 if (text.includes('npc') || text.includes('intercambiar')) continue;
                 // Evitar diálogos de protección/plus
                 if (text.includes('prolong') || text.includes('proteger') || text.includes('protecc')) continue;
 
+                const actionUrl = extractActionUrl(btn);
                 const isUpgradeKeyword = upgradeKeywords.some(k => text.includes(k));
                 const isUpgradeClass = ['build', 'upgrade', 'contract'].some(k => classes.includes(k));
                 if (!isUpgradeKeyword && !isUpgradeClass) continue;
 
+                if (actionUrl) return { success: true, url: actionUrl };
+
                 btn.click();
-                return { success: true };
+                return { success: true, url: null };
             }
             if (document.querySelector('.queueFull, .buildingQueueFull')) return { success: false, reason: 'queue_full' };
             return { success: false, reason: 'not_enough_resources' };
         });
 
         if (result.success) {
-            await humanDelay(this.page, 2000, 3000);
+            if (result.url) {
+                const targetUrl = result.url.startsWith('http')
+                    ? result.url
+                    : `${process.env.GAME_URL}${result.url.startsWith('/') ? '' : '/'}${result.url}`;
+                await this.page.goto(targetUrl, { waitUntil: 'domcontentloaded' });
+                await humanDelay(this.page, 1500, 2200);
+            } else {
+                await humanDelay(this.page, 2000, 3000);
+            }
             return { success: true };
         }
         return { success: false, reason: result.reason };
@@ -906,147 +963,120 @@ class GameClient {
     }
 
     async executeTraining(buildingType, troopIdentifier, quantity = -1, buildingSlot = null) {
-        if (this.page.isClosed()) return { success: false, reason: 'browser_closed' };
 
-        const slot = await this.findBuildingSlot(buildingType, buildingSlot);
-        if (!slot) return { success: false, reason: 'building_not_found' };
+    if (this.page.isClosed()) return { success: false, reason: 'browser_closed' };
 
-        try {
-            await this.page.goto(`${process.env.GAME_URL}/build.php?id=${slot}`, { waitUntil: 'domcontentloaded' });
-            await humanDelay(this.page, 1200, 2000);
-        } catch (error) {
-            logger.warn('No se pudo abrir la pagina de entrenamiento: ' + error.message);
-            return { success: false, reason: 'navigation_failed' };
-        }
+    const slot = await this.findBuildingSlot(buildingType, buildingSlot);
 
-        const result = await this.page.evaluate(({ identifier, quantity }) => {
+    if (!slot) return { success: false, reason: 'building_not_found' };
+
+    try {
+
+        await this.page.goto(`${process.env.GAME_URL}/build.php?id=${slot}`, { waitUntil: 'domcontentloaded' });
+
+        await humanDelay(this.page, 1200, 2000);
+
+    } catch (error) {
+
+        logger.warn('No se pudo abrir la pagina de entrenamiento: ' + error.message);
+
+        return { success: false, reason: 'navigation_failed' };
+
+    }
+
+    const readExistingTroopCount = async () => {
+        return await this.page.evaluate(({ identifier }) => {
             const normalize = (text) => (text || '')
                 .toLowerCase()
                 .normalize('NFD')
                 .replace(/[\u0300-\u036f]/g, '')
+                .replace(/\s+/g, ' ')
                 .trim();
 
-            const identifierIsNumber = typeof identifier === 'number' || (typeof identifier === 'string' && /^\d+$/.test(identifier));
-            const targetIndex = identifierIsNumber ? parseInt(identifier, 10) : null;
-            const targetName = identifierIsNumber ? null : normalize(identifier);
+            const targetName = typeof identifier === 'string' ? normalize(identifier) : null;
+            if (!targetName) return null;
 
-            const allInputs = Array.from(document.querySelectorAll('input[name^="t"], input[name*="t"], input[data-unitid], input[data-unit], input[type="number"]'));
-            const rows = allInputs.map(input => input.closest('tr') || input.closest('.unit') || input.closest('.trainUnits') || input.closest('.textList') || input.closest('.unitWrapper') || input.parentElement).filter(Boolean);
+            const stop = new Set(['de', 'del', 'la', 'el', 'los', 'las', 'und', 'der', 'die', 'das', 'a', 'to']);
+            const tokens = targetName.split(' ').map(t => t.trim()).filter(t => t && !stop.has(t) && t.length >= 4);
 
-            const pickQuantity = (row, input) => {
-                if (quantity !== -1) return quantity;
-
-                const maxAttr = input.getAttribute('max');
-                if (maxAttr && !isNaN(parseInt(maxAttr, 10))) return parseInt(maxAttr, 10);
-
-                const maxNode = row.querySelector('.max, a.max');
-                if (maxNode) {
-                    const match = maxNode.innerText.match(/(\d+)/);
-                    if (match) return parseInt(match[1], 10);
-                }
-
-                const valueNode = row.querySelector('.value, .maxValue');
-                if (valueNode) {
-                    const match = valueNode.innerText.match(/(\d+)/);
-                    if (match) return parseInt(match[1], 10);
-                }
-
-                return 0;
+            const tokenMatch = (haystack, needle) => {
+                const n = normalize(needle);
+                if (!n) return false;
+                if (haystack.includes(n)) return true;
+                if (haystack.includes(n + 's')) return true;
+                if (haystack.includes(n + 'es')) return true;
+                if (n.length >= 5 && haystack.includes(n.slice(0, -1))) return true;
+                if (n.length >= 6 && haystack.includes(n.slice(0, -2))) return true;
+                if (n.length >= 5 && haystack.includes(n.slice(1))) return true;
+                return false;
             };
 
-            const seen = new Set();
+            const matchesByTokens = (text) => {
+                if (!text) return false;
+                if (text.includes(targetName)) return true;
+                if (!tokens.length) return false;
+                const matched = tokens.filter(t => tokenMatch(text, t)).length;
+                return matched === tokens.length || (tokens.length === 1 && matched === 1);
+            };
+
+            const inputs = Array.from(document.querySelectorAll('input[name^="t"], input[name*="t"], input[data-unitid], input[data-unit]'));
+            const rows = inputs.map(input => input.closest('tr') || input.closest('.unit') || input.closest('.trainUnits') || input.closest('.textList') || input.closest('.unitWrapper') || input.parentElement).filter(Boolean);
+
             for (const row of rows) {
-                if (seen.has(row)) continue;
-                seen.add(row);
+                const rowText = normalize(row.innerText || '');
+                if (!matchesByTokens(rowText)) continue;
 
-                const input = row.querySelector('input[name^="t"], input[name*="t"], input[data-unitid], input[data-unit], input[type="number"]');
-                if (!input) continue;
-
-                const inputName = input.getAttribute('name') || '';
-                const dataUnit = input.getAttribute('data-unitid') || input.getAttribute('data-unit') || null;
-                const indexMatch = inputName.match(/t(\d+)/);
-                const troopIndex = indexMatch ? parseInt(indexMatch[1], 10) : (dataUnit ? parseInt(dataUnit, 10) : null);
-
-                const rowText = normalize(row.innerText);
-                const imgAlt = normalize((row.querySelector('img') || {}).alt || '');
-                const candidateText = `${rowText} ${imgAlt}`.trim();
-
-                const matches = targetIndex !== null
-                    ? troopIndex === targetIndex
-                    : candidateText.includes(targetName);
-
-                if (!matches) continue;
-
-                const qty = pickQuantity(row, input);
-                if (!qty || qty <= 0) {
-                    return { success: false, reason: 'not_enough_resources_or_zero_max' };
-                }
-
-                if (typeof input.scrollIntoView === 'function') {
-                    input.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                }
-
-                input.value = qty;
-                input.dispatchEvent(new Event('input', { bubbles: true }));
-                input.dispatchEvent(new Event('change', { bubbles: true }));
-
-                const form = input.closest('form') || document.querySelector('form[action*="train"]');
-                if (!form) return { success: false, reason: 'form_not_found' };
-
-                const buttons = Array.from(form.querySelectorAll('button, input[type="submit"]'));
-                const btn = buttons.find(b => {
-                    if (b.disabled) return false;
-                    const label = normalize(b.innerText || b.value || '');
-                    if (label.includes('formacion') || label.includes('formar') || label.includes('formation')) return true;
-                    return label.includes('entrenar') || label.includes('train') || label.includes('reclutar') || label.includes('enviar');
-                }) || buttons.find(b => !b.disabled);
-
-                if (!btn) return { success: false, reason: 'submit_button_not_found' };
-                if (typeof btn.scrollIntoView === 'function') {
-                    btn.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                }
-                btn.click();
-                const isSubmitBtn = (btn.tagName === 'BUTTON' && (btn.getAttribute('type') || '').toLowerCase() === 'submit') ||
-                    (btn.tagName === 'INPUT' && (btn.getAttribute('type') || '').toLowerCase() === 'submit');
-                if (typeof form.requestSubmit === 'function') {
-                    if (isSubmitBtn) form.requestSubmit(btn);
-                    else form.requestSubmit();
-                } else if (typeof form.submit === 'function') {
-                    form.submit();
-                }
-                return { success: true, trained: qty };
+                const m = rowText.match(/existente\s*:\s*(\d{1,9})/);
+                if (m) return parseInt(m[1], 10);
             }
 
-            return { success: false, reason: 'troop_not_found' };
-        }, { identifier: troopIdentifier, quantity });
+            return null;
+        }, { identifier: troopIdentifier }).catch(() => null);
+    };
 
-        if (!result.success) return result;
-
-        await humanDelay(this.page, 2000, 3200);
-
-        // Recargar la página para leer la cola actualizada
-        try {
-            await this.page.goto(`${process.env.GAME_URL}/build.php?id=${slot}`, { waitUntil: 'domcontentloaded' });
-            await humanDelay(this.page, 900, 1400);
-        } catch (navErr) {
-            logger.warn('No se pudo recargar pagina de entrenamiento para verificar cola: ' + navErr.message);
-        }
-
-        const verify = await this.page.evaluate(({ identifier }) => {
+    const readQueuedTroopCount = async () => {
+        return await this.page.evaluate(({ identifier }) => {
             const normalize = (text) => (text || '')
                 .toLowerCase()
                 .normalize('NFD')
                 .replace(/[\u0300-\u036f]/g, '')
+                .replace(/\s+/g, ' ')
                 .trim();
 
-            const targetName = typeof identifier === 'string'
-                ? normalize(identifier)
-                : null;
+            const targetName = typeof identifier === 'string' ? normalize(identifier) : null;
+            if (!targetName) return null;
 
-            const errorEl = document.querySelector('.error, .alert, .warning, .messageError');
-            if (errorEl) {
-                return { ok: false, reason: 'page_error', message: normalize(errorEl.innerText) };
-            }
+            const stop = new Set(['de', 'del', 'la', 'el', 'los', 'las', 'und', 'der', 'die', 'das', 'a', 'to']);
+            const tokens = targetName.split(' ').map(t => t.trim()).filter(t => t && !stop.has(t) && t.length >= 4);
+
+            const tokenMatch = (haystack, needle) => {
+                const n = normalize(needle);
+                if (!n) return false;
+                if (haystack.includes(n)) return true;
+                if (haystack.includes(n + 's')) return true;
+                if (haystack.includes(n + 'es')) return true;
+                if (n.length >= 5 && haystack.includes(n.slice(0, -1))) return true;
+                if (n.length >= 6 && haystack.includes(n.slice(0, -2))) return true;
+                if (n.length >= 5 && haystack.includes(n.slice(1))) return true;
+                return false;
+            };
+
+            const lineMatches = (line) => {
+                if (!line) return false;
+                if (line.includes(targetName)) return true;
+                if (!tokens.length) return false;
+                const matched = tokens.filter(t => tokenMatch(line, t)).length;
+                return matched === tokens.length || (tokens.length === 1 && matched === 1);
+            };
+
+            const parseCountFromText = (text) => {
+                if (!text) return null;
+                const m1 = text.match(/^\s*(\d{1,6})\s*(x\b|\s+)/);
+                if (m1) return parseInt(m1[1], 10);
+                const m2 = text.match(/\b(\d{1,6})\s*x\b/);
+                if (m2) return parseInt(m2[1], 10);
+                return null;
+            };
 
             const queueSelectors = [
                 '.under_progress', '.under-progress', '.trainingQueue', '.productionQueue',
@@ -1057,78 +1087,464 @@ class GameClient {
             ];
 
             const queueEntries = Array.from(document.querySelectorAll(queueSelectors.join(',')))
-                // Evitar el formulario principal de entrenamiento (contiene inputs numéricos)
-                .filter(node => !node.querySelector('input[type=\"number\"], input[name^=\"t\"], input[name*=\"t\"]'));
+                .filter(node => !node.querySelector('input[type="number"], input[name^="t"], input[name*="t"]'));
 
-            const matchesEntry = (node) => {
-                const text = normalize(node.innerText || '');
-                const hasTimer = /\d{1,2}:\d{2}/.test(text) || text.includes('curso') || text.includes('cola') || text.includes('queue');
+            let total = 0;
+            let sawMatch = false;
+            let sawMatchWithoutCount = false;
 
-                // Revisar imágenes con alt/title
-                const imgs = Array.from(node.querySelectorAll('img'));
-                const imgMatch = targetName && imgs.some(img => {
-                    const alt = normalize(img.getAttribute('alt') || '');
-                    const title = normalize(img.getAttribute('title') || '');
-                    return alt.includes(targetName) || title.includes(targetName);
-                });
+            const processContainer = (container) => {
+                const raw = container && container.innerText ? String(container.innerText) : '';
+                if (!raw) return;
 
-                if (targetName) {
-                    if (hasTimer && text.includes(targetName)) return true;
-                    if (hasTimer && imgMatch) return true;
-                } else if (hasTimer && /\d+\s*x/.test(text)) {
-                    return true;
+                const lines = raw.split(/\r?\n/).map(l => normalize(l)).filter(Boolean);
+
+                for (const line of lines) {
+                    if (!lineMatches(line)) continue;
+                    sawMatch = true;
+                    const count = parseCountFromText(line);
+                    if (typeof count === 'number' && !Number.isNaN(count)) total += count;
+                    else sawMatchWithoutCount = true;
                 }
-
-                return false;
             };
 
-            if (queueEntries.some(matchesEntry)) return { ok: true };
+            for (const entry of queueEntries) processContainer(entry);
 
-            // Fallback: buscar timers y nombre de tropa en bloques con temporizador
-            const timers = Array.from(document.querySelectorAll('.timer, .dur, .countdown'));
-            for (const timer of timers) {
-                const container = timer.closest('li, tr, .textList, .buildDetails, .details, .queue, .under_progress, .under-progress') || timer.parentElement;
-                const text = normalize((container && container.innerText) || '');
-                if (!text) continue;
+            if (sawMatch) {
+                if (total > 0) return total;
+                return sawMatchWithoutCount ? null : 0;
+            }
 
-                const imgs = container ? Array.from(container.querySelectorAll('img')) : [];
-                const imgMatch = targetName && imgs.some(img => {
-                    const alt = normalize(img.getAttribute('alt') || '');
-                    const title = normalize(img.getAttribute('title') || '');
-                    return alt.includes(targetName) || title.includes(targetName);
-                });
+            const headings = Array.from(document.querySelectorAll('h2, h3, h4, .headline, .sectionTitle, .title'));
+            const heading = headings.find(h => normalize(h.textContent || '').includes('entrenando'));
+            const root = heading ? (heading.closest('.content, #content, .box, .section') || heading.parentElement) : null;
 
-                if (targetName) {
-                    if (text.includes(targetName) || imgMatch) return { ok: true };
-                } else if (/\d+\s*x/.test(text)) {
-                    return { ok: true };
+            if (root) {
+                const candidates = Array.from(root.querySelectorAll('tr, li, .row')).slice(0, 150);
+                for (const node of candidates) processContainer(node);
+                if (sawMatch) {
+                    if (total > 0) return total;
+                    return sawMatchWithoutCount ? null : 0;
                 }
             }
 
-            const queueText = queueEntries.map(n => normalize(n.innerText || '')).filter(Boolean).slice(0, 5);
-
-            return { ok: false, reason: 'training_not_queued', queueText };
+            return 0;
         }, { identifier: troopIdentifier }).catch(() => null);
+    };
 
-        if (!verify || !verify.ok) {
-            try { await this.screenshot('training-fail.png'); } catch (e) {}
-            return {
-                success: false,
-                reason: (verify && verify.reason) || 'training_not_queued',
-                detail: (verify && verify.message) || null,
-                queueText: (verify && verify.queueText) || null
-            };
+    const beforeExistingCount = await readExistingTroopCount();
+    const beforeQueuedCount = await readQueuedTroopCount();
+
+    const result = await this.page.evaluate(({ identifier, quantity }) => {
+
+        const normalize = (text) => (text || '')
+
+            .toLowerCase()
+
+            .normalize('NFD')
+
+            .replace(/[\u0300-\u036f]/g, '')
+
+            .trim();
+
+        const identifierIsNumber = typeof identifier === 'number' || (typeof identifier === 'string' && /^\d+$/.test(identifier));
+
+        const targetIndex = identifierIsNumber ? parseInt(identifier, 10) : null;
+
+        const targetName = identifierIsNumber ? null : normalize(identifier);
+
+        // Importante: NO incluir input[type="number"] genérico porque en muchas pantallas hay inputs numéricos
+        // que no son de entrenamiento (causa falsos positivos y "entrena" sin entrenar).
+        const allInputs = Array.from(document.querySelectorAll('input[name^="t"], input[name*="t"], input[data-unitid], input[data-unit]'));
+
+        const rows = allInputs.map(input => input.closest('tr') || input.closest('.unit') || input.closest('.trainUnits') || input.closest('.textList') || input.closest('.unitWrapper') || input.parentElement).filter(Boolean);
+
+        const pickQuantity = (row, input) => {
+
+            if (quantity !== -1) return quantity;
+
+            const maxAttr = input.getAttribute('max');
+
+            if (maxAttr && !isNaN(parseInt(maxAttr, 10))) return parseInt(maxAttr, 10);
+
+            const maxNode = row.querySelector('.max, a.max');
+
+            if (maxNode) {
+
+                const match = maxNode.innerText.match(/(\d+)/);
+
+                if (match) return parseInt(match[1], 10);
+
+            }
+
+            const slashMatch = (row.innerText || '').match(/\/\s*(\d{1,6})/);
+            if (slashMatch) return parseInt(slashMatch[1], 10);
+
+            const valueNode = row.querySelector('.value, .maxValue');
+
+            if (valueNode) {
+
+                const match = valueNode.innerText.match(/(\d+)/);
+
+                if (match) return parseInt(match[1], 10);
+
+            }
+
+            return 0;
+
+        };
+
+        const seen = new Set();
+
+        for (const row of rows) {
+
+            if (seen.has(row)) continue;
+
+            seen.add(row);
+
+            const input = row.querySelector('input[name^="t"], input[name*="t"], input[data-unitid], input[data-unit]');
+
+            if (!input) continue;
+
+            const inputName = input.getAttribute('name') || '';
+
+            const dataUnit = input.getAttribute('data-unitid') || input.getAttribute('data-unit') || null;
+
+            const indexMatch = inputName.match(/t(\d+)/);
+
+            const troopIndex = indexMatch ? parseInt(indexMatch[1], 10) : (dataUnit ? parseInt(dataUnit, 10) : null);
+
+            const rowText = normalize(row.innerText);
+
+            const imgAlt = normalize((row.querySelector('img') || {}).alt || '');
+
+            const candidateText = `${rowText} ${imgAlt}`.trim();
+
+            const matches = targetIndex !== null
+
+                ? troopIndex === targetIndex
+
+                : candidateText.includes(targetName);
+
+            if (!matches) continue;
+
+            const qty = pickQuantity(row, input);
+
+            if (!qty || qty <= 0) {
+
+                return { success: false, reason: 'not_enough_resources_or_zero_max' };
+
+            }
+
+            if (typeof input.scrollIntoView === 'function') {
+
+                input.scrollIntoView({ behavior: 'smooth', block: 'center' });
+
+            }
+
+                input.value = String(qty);
+
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+
+            input.dispatchEvent(new Event('change', { bubbles: true }));
+
+            const form = input.closest('form') || document.querySelector('form[action*="train"]');
+
+            if (!form) return { success: false, reason: 'form_not_found' };
+
+            const buttons = Array.from(form.querySelectorAll('button, input[type="submit"]'));
+
+            const btn = buttons.find(b => {
+
+                if (b.disabled) return false;
+
+                const label = normalize(b.innerText || b.value || '');
+
+                const cls = normalize(b.className || '');
+                if (cls.includes('starttraining')) return true;
+
+                if (label.includes('entrenar') || label.includes('train') || label.includes('reclutar')) return true;
+
+                // En algunos servidores el botón de entrenar se llama "Formación"
+                if (label.includes('formacion') || label.includes('formation')) return true;
+
+                return false;
+
+            }) || buttons.find(b => !b.disabled);
+
+            if (!btn) return { success: false, reason: 'submit_button_not_found' };
+
+            if (typeof btn.scrollIntoView === 'function') {
+
+                btn.scrollIntoView({ behavior: 'smooth', block: 'center' });
+
+            }
+
+            btn.click();
+
+            const isSubmitBtn = (btn.tagName === 'BUTTON' && (btn.getAttribute('type') || '').toLowerCase() === 'submit') ||
+
+                (btn.tagName === 'INPUT' && (btn.getAttribute('type') || '').toLowerCase() === 'submit');
+
+            if (typeof form.requestSubmit === 'function') {
+
+                if (isSubmitBtn) form.requestSubmit(btn);
+
+                else form.requestSubmit();
+
+            } else if (typeof form.submit === 'function') {
+
+                form.submit();
+
+            }
+
+            return { success: true, trained: qty };
+
         }
 
-        return result;
+        return { success: false, reason: 'troop_not_found' };
+
+    }, { identifier: troopIdentifier, quantity });
+
+    if (!result.success) return result;
+
+    await humanDelay(this.page, 2000, 3200);
+
+    // Recargar la página para leer la cola actualizada
+
+    try {
+
+        await this.page.goto(`${process.env.GAME_URL}/build.php?id=${slot}`, { waitUntil: 'domcontentloaded' });
+
+        await humanDelay(this.page, 900, 1400);
+
+    } catch (navErr) {
+
+        logger.warn('No se pudo recargar pagina de entrenamiento para verificar cola: ' + navErr.message);
+
     }
+
+    const verify = await this.page.evaluate(({ identifier }) => {
+
+        const normalize = (text) => (text || '')
+
+            .toLowerCase()
+
+            .normalize('NFD')
+
+            .replace(/[\u0300-\u036f]/g, '')
+
+            .trim();
+
+        const targetName = typeof identifier === 'string'
+
+            ? normalize(identifier)
+
+            : null;
+
+        const errorEl = document.querySelector('.error, .alert, .warning, .messageError');
+
+        if (errorEl) {
+
+            return { ok: false, reason: 'page_error', message: normalize(errorEl.innerText) };
+
+        }
+
+        const queueSelectors = [
+
+            '.under_progress', '.under-progress', '.trainingQueue', '.productionQueue',
+
+            '.queue', '.underConstruction', '.build_queue', '.buildingList .under_progress',
+
+            '.boxes-contents .under_progress', '.boxes-contents .under-progress',
+
+            '.productionWrapper .under_progress', '.productionWrapper .under-progress',
+
+            '#trainQueue', '.trainingList', '.queueWrapper', '.unitQueue'
+
+        ];
+
+        const queueEntries = Array.from(document.querySelectorAll(queueSelectors.join(',')))
+
+            // Evitar el formulario principal de entrenamiento (contiene inputs numéricos)
+
+            .filter(node => !node.querySelector('input[type="number"], input[name^="t"], input[name*="t"]'));
+
+        const matchesEntry = (node) => {
+
+            const text = normalize(node.innerText || '');
+
+            const hasTimer =
+                /\d{1,2}:\d{2}/.test(text) ||
+                /\d{1,2}:\d{2}:\d{2}/.test(text) ||
+                text.includes('curso') ||
+                text.includes('cola') ||
+                text.includes('queue') ||
+                text.includes('termina') ||
+                text.includes('listo') ||
+                text.includes('duracion') ||
+                text.includes('unidades') ||
+                text.includes('unidad');
+
+            // Revisar imágenes con alt/title
+
+            const imgs = Array.from(node.querySelectorAll('img'));
+
+            const imgMatch = targetName && imgs.some(img => {
+
+                const alt = normalize(img.getAttribute('alt') || '');
+
+                const title = normalize(img.getAttribute('title') || '');
+
+                return alt.includes(targetName) || title.includes(targetName);
+
+            });
+
+            const tokenMatch = (haystack, needle) => {
+                const n = normalize(needle);
+                if (!n) return false;
+                if (haystack.includes(n)) return true;
+                if (haystack.includes(n + 's')) return true;
+                if (haystack.includes(n + 'es')) return true;
+                if (n.length >= 5 && haystack.includes(n.slice(0, -1))) return true;
+                if (n.length >= 6 && haystack.includes(n.slice(0, -2))) return true;
+                if (n.length >= 5 && haystack.includes(n.slice(1))) return true;
+                return false;
+            };
+
+            const matchesByTokens = () => {
+                if (!targetName) return false;
+                if (text.includes(targetName)) return true;
+                if (imgMatch) return true;
+
+                const stop = new Set(['de', 'del', 'la', 'el', 'los', 'las', 'und', 'der', 'die', 'das', 'a', 'to']);
+                const tokens = targetName.split(' ').map(t => t.trim()).filter(t => t && !stop.has(t) && t.length >= 4);
+                if (!tokens.length) return false;
+
+                const matched = tokens.filter(t => tokenMatch(text, t)).length;
+                if (matched === tokens.length) return true;
+                if (matched >= 1 && hasTimer) return true;
+                return false;
+            };
+
+            if (targetName) {
+                if (matchesByTokens()) return true;
+            } else if (hasTimer && /\d+\s*x/.test(text)) {
+                return true;
+            }
+
+            return false;
+
+        };
+
+        if (queueEntries.some(matchesEntry)) return { ok: true };
+
+        // Fallback: buscar timers y nombre de tropa en bloques con temporizador
+
+        const timers = Array.from(document.querySelectorAll('.timer, .dur, .countdown'));
+
+        for (const timer of timers) {
+
+            const container = timer.closest('li, tr, .textList, .buildDetails, .details, .queue, .under_progress, .under-progress') || timer.parentElement;
+
+            const text = normalize((container && container.innerText) || '');
+
+            if (!text) continue;
+
+            const imgs = container ? Array.from(container.querySelectorAll('img')) : [];
+
+            const imgMatch = targetName && imgs.some(img => {
+
+                const alt = normalize(img.getAttribute('alt') || '');
+
+                const title = normalize(img.getAttribute('title') || '');
+
+                return alt.includes(targetName) || title.includes(targetName);
+
+            });
+
+            if (targetName) {
+
+                if (text.includes(targetName) || imgMatch) return { ok: true };
+
+            } else if (/\d+\s*x/.test(text)) {
+
+                return { ok: true };
+
+            }
+
+        }
+
+        const queueText = queueEntries.map(n => normalize(n.innerText || '')).filter(Boolean).slice(0, 5);
+
+        return { ok: false, reason: 'training_not_queued', queueText };
+
+    }, { identifier: troopIdentifier }).catch(() => null);
+
+    // Importante: NO marcar éxito si no podemos verificar que quedó en cola.
+    if (!verify) {
+        logger.warn('No se pudo verificar la cola de entrenamiento (verify=null). Se mantiene la tarea pendiente.');
+        try { await this.screenshot('training-verify-null.png'); } catch (e) {}
+        return { success: false, reason: 'training_verify_failed' };
+    }
+
+    if (!verify.ok) {
+        logger.warn('Verificación de cola falló (' + (verify.reason || 'unknown') + '). Se mantiene la tarea pendiente.');
+        if (verify.queueText && verify.queueText.length > 0) {
+            logger.info('Contenido de cola detectado: ' + verify.queueText.join(' | '));
+        }
+        try { await this.screenshot('training-verify-failed.png'); } catch (e) {}
+        return { success: false, reason: verify.reason || 'training_not_queued' };
+    }
+
+    if (typeof troopIdentifier === 'string' && typeof result.trained === 'number' && result.trained > 0) {
+        const afterExistingCount = await readExistingTroopCount();
+        const afterQueuedCount = await readQueuedTroopCount();
+
+        const beforeQueued = typeof beforeQueuedCount === 'number' ? beforeQueuedCount : null;
+        const afterQueued = typeof afterQueuedCount === 'number' ? afterQueuedCount : null;
+        const beforeExisting = typeof beforeExistingCount === 'number' ? beforeExistingCount : null;
+        const afterExisting = typeof afterExistingCount === 'number' ? afterExistingCount : null;
+
+        const beforeTotal = (beforeQueued !== null && beforeExisting !== null) ? (beforeQueued + beforeExisting) : null;
+        const afterTotal = (afterQueued !== null && afterExisting !== null) ? (afterQueued + afterExisting) : null;
+
+        if (beforeTotal !== null && afterTotal !== null) {
+            const applied = Math.max(0, afterTotal - beforeTotal);
+            if (applied <= 0) {
+                logger.warn(`Entrenamiento no reflejado en total (cola+existentes): antes=${beforeTotal} despues=${afterTotal} esperado>=${beforeTotal + result.trained}`);
+                try { await this.screenshot('training-total-not-increased.png'); } catch (e) {}
+                return { success: false, reason: 'training_not_applied' };
+            }
+            if (applied < result.trained) {
+                logger.warn(`Entrenamiento parcial detectado (cola+existentes): pedido=${result.trained} aplicado=${applied}. Ajustando conteo.`);
+            }
+            result.trained = Math.min(result.trained, applied);
+            return result;
+        }
+
+        if (beforeQueued === null || afterQueued === null) {
+            logger.warn('No se pudo leer el contador de cola tras entrenar. Se da por valida la verificacion visual.');
+            try { await this.screenshot('training-count-unknown.png'); } catch (e) {}
+            return result;
+        }
+
+        if (afterQueued < beforeQueued + result.trained) {
+            logger.warn(`Entrenamiento no reflejado en cola: antes=${beforeQueued} despues=${afterQueued} esperado>=${beforeQueued + result.trained}`);
+            try { await this.screenshot('training-count-not-increased.png'); } catch (e) {}
+            return { success: false, reason: 'training_not_applied' };
+        }
+    }
+
+    return result;
+
+}
 
     async getBuildingInfo() {
         if (this.page.isClosed()) return {};
         return await this.page.evaluate(() => {
-            const isEmpty =
-                !!document.querySelector('.g0, .aid0, .buildingWrapper.g0, .buildingWrapper.aid0, .constructionSite, .buildNewBuilding, .newBuilding') ||
-                !!document.querySelector('a[href*="gid="], a[href*="gid="] .name');
+            const bodyClass = (document.body && document.body.className) ? String(document.body.className) : '';
+            const isEmpty = /\bgid0\b/i.test(bodyClass) || /\baid0\b/i.test(bodyClass);
 
             const titleEl = document.querySelector('.titleInHeader, h1');
             if (!titleEl) {
@@ -1137,8 +1553,16 @@ class GameClient {
 
             const text = (titleEl.textContent || '').trim();
             const levelMatch = text.match(/(\d+)/);
+            const lower = (text || '')
+                .toLowerCase()
+                .normalize('NFD')
+                .replace(/[\u0300-\u036f]/g, '')
+                .replace(/\s+/g, ' ')
+                .trim();
+
+            const looksEmptyTitle = lower.includes('construir') || lower.includes('build new') || lower.includes('bauplatz');
             return {
-                empty: false,
+                empty: isEmpty || looksEmptyTitle,
                 name: text.replace(/\d+/, '').trim(),
                 level: levelMatch ? parseInt(levelMatch[0]) : 0
             };
