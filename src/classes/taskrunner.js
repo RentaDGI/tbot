@@ -24,6 +24,7 @@ class TaskRunner {
         this.cycleCount = 0;
         this.lastOasisRaid = 0;
         this.nextFarmListRunAt = 0;
+        this.lastBuildVillageId = null;
     }
 
     getFarmListIntervalMs() {
@@ -122,7 +123,14 @@ class TaskRunner {
                         tasksByVillage[villageId].push(task);
                     }
 
-                    const villageIds = Object.keys(tasksByVillage);
+                    let villageIds = Object.keys(tasksByVillage);
+                    if (villageIds.length > 1 && this.lastBuildVillageId) {
+                        const lastIndex = villageIds.indexOf(this.lastBuildVillageId);
+                        if (lastIndex !== -1) {
+                            const start = (lastIndex + 1) % villageIds.length;
+                            villageIds = villageIds.slice(start).concat(villageIds.slice(0, start));
+                        }
+                    }
                     logger.info('Construccion: procesando ' + villageIds.length + ' aldea(s) con ' + buildTasks.length + ' tarea(s) total');
 
                     // Procesar cada aldea
@@ -157,6 +165,7 @@ class TaskRunner {
 
                             // Si hubo éxito, continuar con la siguiente aldea en el próximo ciclo
                             if (result.success) {
+                                this.lastBuildVillageId = villageId;
                                 break;
                             }
                         }

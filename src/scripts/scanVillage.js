@@ -4,8 +4,9 @@
  */
 
 require('dotenv').config();
-const { chromium } = require('playwright');
+const readline = require('readline');
 const { createClient } = require('@supabase/supabase-js');
+const GameClient = require('../classes/GameClient');
 
 function normalize(txt) {
     return (txt || '')
@@ -16,33 +17,68 @@ function normalize(txt) {
         .trim();
 }
 
+async function ask(prompt) {
+    const rl = readline.createInterface({
+        input: process.stdin,
+        output: process.stdout
+    });
+
+    const answer = await new Promise(resolve => rl.question(prompt, resolve));
+    rl.close();
+    return answer;
+}
+
 async function scanVillage() {
     console.log('Escaneando aldea...\n');
 
-    const browser = await chromium.launch({ headless: false });
-    const context = await browser.newContext({
-        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        viewport: { width: 1366, height: 768 }
-    });
-    const page = await context.newPage();
+    const client = new GameClient();
+    await client.init();
 
     try {
-        await page.goto(process.env.GAME_URL, { waitUntil: 'networkidle' });
-        await page.waitForTimeout(2000);
+        await client.login();
 
-        const loginField = await page.$('input[name="name"], input[name="username"]');
-        if (loginField) {
-            console.log('Iniciando sesion...');
-            await loginField.fill(process.env.GAME_USERNAME);
+        const villages = await client.getVillages();
+        let targetInput = process.argv.slice(2).join(' ').trim();
 
-            const passField = await page.$('input[name="password"], input[type="password"]');
-            if (passField) await passField.fill(process.env.GAME_PASSWORD);
+        if (!targetInput) {
+            if (villages.length) {
+                console.log('Aldeas detectadas:\n');
+                for (const v of villages) {
+                    console.log(`- ${v.id}  ${v.name}`);
+                }
+                console.log('');
+            }
 
-            const loginBtn = await page.$('button[type="submit"], input[type="submit"]');
-            if (loginBtn) await loginBtn.click();
-
-            await page.waitForTimeout(3000);
+            targetInput = (await ask('Village id o nombre [main]: ')).trim();
         }
+
+        if (!targetInput) targetInput = 'main';
+
+        let selectedVillage = null;
+        if (targetInput.toLowerCase() !== 'main' && villages.length) {
+            if (/^\d+$/.test(targetInput)) {
+                selectedVillage = villages.find(v => v.id === targetInput) || { id: targetInput, name: targetInput };
+            } else {
+                const targetNorm = normalize(targetInput);
+                selectedVillage = villages.find(v => {
+                    const nameNorm = normalize(v.name);
+                    return nameNorm === targetNorm || nameNorm.includes(targetNorm) || targetNorm.includes(nameNorm);
+                });
+            }
+        }
+
+        const switchTarget = selectedVillage ? selectedVillage.id : targetInput;
+        if (switchTarget.toLowerCase() !== 'main') {
+            const switched = await client.switchToVillage(switchTarget);
+            if (!switched) {
+                console.log('No se pudo cambiar a la aldea solicitada.');
+                return;
+            }
+        }
+
+        console.log(`Usando aldea: ${selectedVillage ? `${selectedVillage.id} (${selectedVillage.name})` : switchTarget}`);
+
+        const page = client.page;
 
         console.log('CAMPOS DE RECURSOS (Slots 1-18)\n');
         await page.goto(`${process.env.GAME_URL}/dorf1.php`, { waitUntil: 'networkidle' });
@@ -153,6 +189,8 @@ async function scanVillage() {
         if (account) {
             await supabase.from('accounts').update({
                 village_scan: {
+                    village_id: selectedVillage ? selectedVillage.id : switchTarget,
+                    village_name: selectedVillage ? selectedVillage.name : null,
                     resources: resourceFields,
                     buildings,
                     scanned_at: new Date().toISOString()
@@ -164,7 +202,7 @@ async function scanVillage() {
     } catch (error) {
         console.error('Error:', error.message);
     } finally {
-        await browser.close();
+        await client.close();
     }
 }
 
