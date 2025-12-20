@@ -104,7 +104,7 @@ class TaskRunner {
                 const totalTasks = buildTasks.length + trainingTasks.length;
                 
                 if (totalTasks === 0) {
-                    await this.humanPause('Sin tareas pendientes', 90000, 160000);
+                    await this.humanPause('Sin tareas pendientes', 120000, 300000);
                     continue;
                 }
 
@@ -204,7 +204,7 @@ class TaskRunner {
                            trainingResult.reason === 'not_enough_resources') {
                     await this.humanPause('Sin recursos suficientes', 150000, 230000);
                 } else {
-                    await this.humanPause('Revisando tareas en breve', 30000, 70000);
+                    await this.humanPause('Revisando tareas en breve', 120000, 300000);
                 }
 
             } catch (error) {
