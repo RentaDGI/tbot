@@ -9,6 +9,7 @@
  *   FARM_LIST_NAME=raid
  *   FARM_MAX_POP=50
  *   FARM_MAX_DIST=20
+ *   FARM_MIN_DIST=0
  *   FARM_T1=2
  *   FARM_MAX_TARGETS=100
  *   FARM_TOTAL_TARGETS=200
@@ -50,6 +51,7 @@ async function main() {
         const useMulti = autoNextList || totalTargets > maxTargets;
 
         const maxDistance = toInt(process.env.FARM_MAX_DIST, 20);
+        const minDistance = toInt(process.env.FARM_MIN_DIST, 0);
         const maxPopulationFromEnv = (process.env.FARM_MAX_POP || '').trim();
         const maxPopulation = maxPopulationFromEnv ? toInt(maxPopulationFromEnv, 50) : (source === 'map' ? 50 : undefined);
 
@@ -72,6 +74,7 @@ async function main() {
                     inactiveSearchMaxPages,
                     maxPopulation,
                     maxDistance,
+                    minDistance,
                     centerX: typeof centerX === 'number' ? centerX : undefined,
                     centerY: typeof centerY === 'number' ? centerY : undefined,
                     rallySlot: typeof rallySlot === 'number' ? rallySlot : undefined
@@ -85,6 +88,7 @@ async function main() {
                     inactiveSearchMaxPages,
                     maxPopulation,
                     maxDistance,
+                    minDistance,
                     centerX: typeof centerX === 'number' ? centerX : undefined,
                     centerY: typeof centerY === 'number' ? centerY : undefined,
                     rallySlot: typeof rallySlot === 'number' ? rallySlot : undefined
@@ -124,11 +128,11 @@ async function main() {
         console.log(`Lista: ${result.listName}`);
         console.log(`Centro: (${result.center.x}|${result.center.y}) [${result.center.source}]`);
         if (source === 'map') {
-            console.log(`Filtro: hab < ${result.maxPopulation}, dist < ${result.maxDistance}`);
+            console.log(`Filtro: hab < ${result.maxPopulation}, dist ${result.minDistance || 0}-${result.maxDistance}`);
         } else if (maxPopulation) {
-            console.log(`Filtro: hab < ${maxPopulation} (verificado en mapa), dist < ${maxDistance}`);
+            console.log(`Filtro: hab < ${maxPopulation} (verificado en mapa), dist ${minDistance}-${maxDistance}`);
         } else {
-            console.log(`Filtro: InactiveSearch, dist < ${maxDistance}`);
+            console.log(`Filtro: InactiveSearch, dist ${minDistance}-${maxDistance}`);
         }
         console.log(`Tropas: t1=${result.troopCounts.t1}`);
         console.log(`Anadidos: ${result.addedCount}`);

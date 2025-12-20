@@ -322,8 +322,16 @@ class TaskRunner {
     async handleBuildWithCache(tasks, resourceAmounts = {}) {
         try {
             await this.client.scanFieldsIfNeeded();
+            const resourceTasks = tasks.filter(t => t.building_type);
             const nonResourceTasks = tasks.filter(t => !t.building_type);
-            const lowestField = this.client.findLowestFieldAcrossAllTasks(tasks, resourceAmounts);
+            const maxPriority = (list) => list.reduce((max, t) => {
+                const val = typeof t.priority === 'number' ? t.priority : 0;
+                return val > max ? val : max;
+            }, 0);
+            const maxResourcePriority = maxPriority(resourceTasks);
+            const maxNonResourcePriority = maxPriority(nonResourceTasks);
+            const preferNonResource = nonResourceTasks.length > 0 && maxNonResourcePriority > maxResourcePriority;
+            const lowestField = this.client.findLowestFieldAcrossAllTasks(resourceTasks, resourceAmounts);
 
             const normalize = (txt) => (txt || '')
                 .toLowerCase()
@@ -462,8 +470,18 @@ class TaskRunner {
                 return { success: false, reason: 'nonresource_all_failed' };
             };
 
+            let nonResourceAttempted = false;
+            if (preferNonResource) {
+                nonResourceAttempted = true;
+                const firstTry = await tryNonResource();
+                if (firstTry.success) return firstTry;
+            }
+
             if (!lowestField) {
-                return await tryNonResource();
+                if (!nonResourceAttempted) {
+                    return await tryNonResource();
+                }
+                return { success: false, reason: 'no_resource_candidates' };
             }
 
             await this.client.clickBuildingSlot(lowestField.slot);
@@ -478,8 +496,10 @@ class TaskRunner {
             // Loguea la razón y deja continuar con otras tareas
             logger.info('No se pudo mejorar recurso (motivo: ' + upgradeResult.reason + ').');
             if (upgradeResult.reason === 'not_enough_resources' || upgradeResult.reason === 'queue_full') {
-                const fallback = await tryNonResource();
-                if (fallback.success) return fallback;
+                if (!nonResourceAttempted) {
+                    const fallback = await tryNonResource();
+                    if (fallback.success) return fallback;
+                }
             }
             return { success: false, reason: upgradeResult.reason };
         } catch (error) {

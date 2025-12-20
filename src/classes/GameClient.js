@@ -349,13 +349,15 @@ class GameClient {
                     const resourceValue = typeof resourceAmounts[field.type] === 'number'
                         ? resourceAmounts[field.type]
                         : Number.MAX_SAFE_INTEGER;
+                    const taskPriority = typeof task.priority === 'number' ? task.priority : 0;
                     allCandidates.push({
                         slot: field.slot,
                         type: field.type,
                         level: field.level,
                         task,
                         targetLevel: task.target_level,
-                        resourceValue
+                        resourceValue,
+                        taskPriority
                     });
                 }
             }
@@ -364,8 +366,11 @@ class GameClient {
         if (!allCandidates.length) return null;
 
         allCandidates.sort((a, b) => {
+            if (a.resourceValue !== b.resourceValue) return a.resourceValue - b.resourceValue;
+            if (a.taskPriority !== b.taskPriority) return b.taskPriority - a.taskPriority;
             if (a.level !== b.level) return a.level - b.level;
-            return a.resourceValue - b.resourceValue;
+            if (a.targetLevel !== b.targetLevel) return a.targetLevel - b.targetLevel;
+            return a.slot - b.slot;
         });
 
         const winner = allCandidates[0];
@@ -1788,6 +1793,63 @@ class GameClient {
         return `${baseName}-${index}`;
     }
 
+    _buildFarmListSequence(baseName, existingNames, maxLists) {
+        const baseNorm = this._normalizeText(baseName);
+        const existingSet = new Set(existingNames || []);
+        const entries = [];
+        const seen = new Set();
+
+        const addEntry = (name, exists) => {
+            if (!name) return;
+            if (seen.has(name)) return;
+            seen.add(name);
+            entries.push({ name, exists: !!exists });
+        };
+
+        const baseExists = existingSet.has(baseNorm) || (existingNames || []).some(n => n === baseNorm || n.includes(baseNorm));
+        addEntry(baseNorm, baseExists);
+
+        const hyphenLists = [];
+        const numericLists = [];
+
+        for (const name of existingNames || []) {
+            if (!name || name === baseNorm) continue;
+            if (name.startsWith(`${baseNorm}-`)) {
+                const suffix = name.slice(baseNorm.length + 1);
+                if (/^\d+$/.test(suffix)) {
+                    hyphenLists.push({ name, idx: parseInt(suffix, 10) });
+                }
+                continue;
+            }
+            if (/^\d+$/.test(name)) {
+                numericLists.push({ name, idx: parseInt(name, 10) });
+            }
+        }
+
+        if (hyphenLists.length) {
+            hyphenLists.sort((a, b) => a.idx - b.idx);
+            for (const item of hyphenLists) addEntry(item.name, true);
+        } else if (numericLists.length) {
+            numericLists.sort((a, b) => a.idx - b.idx);
+            for (const item of numericLists) addEntry(item.name, true);
+        }
+
+        let nextHyphen = hyphenLists.length ? Math.max(...hyphenLists.map(h => h.idx)) + 1 : 2;
+        let nextNumeric = numericLists.length ? Math.max(...numericLists.map(n => n.idx)) + 1 : 2;
+
+        while (entries.length < maxLists) {
+            let name;
+            if (hyphenLists.length || !numericLists.length) {
+                name = `${baseNorm}-${nextHyphen++}`;
+            } else {
+                name = String(nextNumeric++);
+            }
+            addEntry(name, false);
+        }
+
+        return entries.slice(0, maxLists);
+    }
+
     async _openFarmListTab(options = {}) {
         if (this.page.isClosed()) return false;
         const rallySlot = await this.findRallyPointSlot(options.rallySlot);
@@ -1840,12 +1902,37 @@ class GameClient {
             const listCandidates = Array.from(document.querySelectorAll(
                 'a, button, .raidList, .listEntry, .listTitle, .name, .raidListTitle, .listTitleText'
             ));
+            const villageCandidates = Array.from(document.querySelectorAll(
+                '#sidebarBoxVillagelist, .villageList, .villageListTitle, .villageListBar, .villageName, .name'
+            ));
+            const villageNames = new Set();
+            for (const el of villageCandidates) {
+                const t = normalize(el.textContent || el.innerText || '');
+                if (t) villageNames.add(t);
+            }
+
+            const exclude = [
+                'lista de vacas',
+                'farm list',
+                'raid list',
+                'crear una lista de vacas',
+                'crear lista de vacas',
+                'crear lista',
+                'crear nueva lista',
+                'new list',
+                'create list',
+                'create new list',
+                'comenzar todas',
+                'start all'
+            ];
 
             for (const el of listCandidates) {
                 const t = normalize(el.textContent || el.innerText || '');
                 if (!t) continue;
                 if (t.length > 50) continue;
                 if (t.includes('comenzar') || t.includes('start all') || t.includes('todas las')) continue;
+                if (exclude.some(e => t === e || t.includes(e))) continue;
+                if (villageNames.has(t)) continue;
                 if (uniq.has(t)) continue;
                 uniq.add(t);
                 names.push(t);
@@ -2111,25 +2198,117 @@ class GameClient {
             const uniq = new Set();
             const targets = [];
 
-            const extractPair = (text) => {
+            const parseNum = (value) => {
+                const n = parseInt(value, 10);
+                return Number.isNaN(n) ? null : n;
+            };
+
+            const extractPairFromText = (text) => {
                 if (!text) return null;
-                const m = String(text).match(/\((-?\d+)\s*\|\s*(-?\d+)\)/) || String(text).match(/(^|\s)(-?\d+)\s*\|\s*(-?\d+)(\s|$)/);
+                const m = String(text).match(/\((-?\d+)\s*\|\s*(-?\d+)\)/) ||
+                          String(text).match(/(^|\s)(-?\d+)\s*\|\s*(-?\d+)(\s|$)/);
                 if (!m) return null;
-                const x = parseInt(m[m.length - 3], 10);
-                const y = parseInt(m[m.length - 2], 10);
-                if (Number.isNaN(x) || Number.isNaN(y)) return null;
+                const x = parseNum(m[m.length - 3]);
+                const y = parseNum(m[m.length - 2]);
+                if (x === null || y === null) return null;
                 return { x, y };
             };
 
-            const rowCandidates = Array.from(document.querySelectorAll('tr, .raidListEntry, .farmListEntry, .slotRow'));
+            const extractPairFromHref = (href) => {
+                if (!href) return null;
+                const m1 = href.match(/[?&]x=(-?\d+).*?[?&]y=(-?\d+)/i);
+                if (m1) {
+                    const x = parseNum(m1[1]);
+                    const y = parseNum(m1[2]);
+                    if (x !== null && y !== null) return { x, y };
+                }
+                const m2 = href.match(/[?&]y=(-?\d+).*?[?&]x=(-?\d+)/i);
+                if (m2) {
+                    const x = parseNum(m2[2]);
+                    const y = parseNum(m2[1]);
+                    if (x !== null && y !== null) return { x, y };
+                }
+                return extractPairFromText(href);
+            };
+
+            const extractPairFromNode = (node) => {
+                if (!node) return null;
+
+                const getAttr = (el, name) => {
+                    if (!el || !el.getAttribute) return null;
+                    const val = el.getAttribute(name);
+                    return val !== null ? val : null;
+                };
+
+                const getDataPair = (el) => {
+                    if (!el) return null;
+                    const dx = (el.dataset && el.dataset.x) || getAttr(el, 'data-x');
+                    const dy = (el.dataset && el.dataset.y) || getAttr(el, 'data-y');
+                    if (dx !== null && dy !== null) {
+                        const x = parseNum(dx);
+                        const y = parseNum(dy);
+                        if (x !== null && y !== null) return { x, y };
+                    }
+
+                    const dCoord = (el.dataset && (el.dataset.coord || el.dataset.coords || el.dataset.coordinates)) ||
+                        getAttr(el, 'data-coord') || getAttr(el, 'data-coords') || getAttr(el, 'data-coordinates');
+                    if (dCoord) {
+                        const pair = extractPairFromText(dCoord);
+                        if (pair) return pair;
+                    }
+
+                    return null;
+                };
+
+                let pair = getDataPair(node);
+                if (pair) return pair;
+
+                if (node.querySelector) {
+                    const dataEl = node.querySelector('[data-x][data-y], [data-coord], [data-coords], [data-coordinates]');
+                    pair = getDataPair(dataEl);
+                    if (pair) return pair;
+
+                    const inputs = Array.from(node.querySelectorAll('input'));
+                    let xVal = null;
+                    let yVal = null;
+                    for (const input of inputs) {
+                        const name = (input.getAttribute('name') || input.getAttribute('id') || '').toLowerCase();
+                        const val = input.value || input.getAttribute('value');
+                        if (!val) continue;
+                        if (xVal === null && (name === 'x' || name.endsWith('xcoord') || name.includes('xcoord'))) {
+                            xVal = val;
+                        } else if (yVal === null && (name === 'y' || name.endsWith('ycoord') || name.includes('ycoord'))) {
+                            yVal = val;
+                        }
+                    }
+                    if (xVal !== null && yVal !== null) {
+                        const x = parseNum(xVal);
+                        const y = parseNum(yVal);
+                        if (x !== null && y !== null) return { x, y };
+                    }
+
+                    const links = Array.from(node.querySelectorAll('a[href]'));
+                    for (const a of links) {
+                        pair = extractPairFromHref(a.getAttribute('href'));
+                        if (pair) return pair;
+                    }
+                }
+
+                return extractPairFromText(node.innerText || node.textContent || '');
+            };
+
+            const rowCandidates = Array.from(document.querySelectorAll(
+                'tr, .raidListEntry, .farmListEntry, .slotRow, .listEntry, .listRow'
+            ));
             for (const row of rowCandidates) {
-                const pair = extractPair(row.innerText);
+                const pair = extractPairFromNode(row);
                 if (!pair) continue;
                 const key = `${pair.x}|${pair.y}`;
                 if (uniq.has(key)) continue;
                 uniq.add(key);
                 targets.push(pair);
             }
+
             return targets;
         });
     }
@@ -2467,9 +2646,28 @@ class GameClient {
         const lists = [];
         let cursor = 0;
 
-        for (let listIndex = 1; listIndex <= maxLists && added.length < wantedTotal; listIndex += 1) {
-            const currentListName = this._farmListNameForIndex(listName, listIndex);
-            await this.openFarmList(currentListName, { rallySlot: options.rallySlot, createIfMissing: true });
+        await this._openFarmListTab({ rallySlot: options.rallySlot });
+        const existingNames = await this._getFarmListNamesOnPage();
+        const listEntries = this._buildFarmListSequence(listName, existingNames, maxLists);
+
+        // Leer objetivos existentes en todas las listas antes de añadir nuevos.
+        for (const entry of listEntries) {
+            await this.openFarmList(entry.name, { rallySlot: options.rallySlot, createIfMissing: !entry.exists });
+            const existing = await this.getFarmListTargets();
+            for (const t of existing) globalExistingSet.add(`${t.x}|${t.y}`);
+        }
+
+        // Leer objetivos existentes en todas las listas antes de añadir nuevos.
+        for (const entry of listEntries) {
+            await this.openFarmList(entry.name, { rallySlot: options.rallySlot, createIfMissing: !entry.exists });
+            const existing = await this.getFarmListTargets();
+            for (const t of existing) globalExistingSet.add(`${t.x}|${t.y}`);
+        }
+
+        for (const entry of listEntries) {
+            if (added.length >= wantedTotal) break;
+            const currentListName = entry.name;
+            await this.openFarmList(currentListName, { rallySlot: options.rallySlot, createIfMissing: !entry.exists });
 
             if (applyTroopsToExisting) {
                 const changed = await this.setFarmListTroopsForAllTargets(troopCounts);
@@ -2477,7 +2675,6 @@ class GameClient {
             }
 
             const existing = await this.getFarmListTargets();
-            for (const t of existing) globalExistingSet.add(`${t.x}|${t.y}`);
             logger.info(`Objetivos actuales en lista "${currentListName}": ${existing.length}`);
 
             const remainingInList = Math.max(0, maxTargetsPerList - existing.length);
@@ -2651,6 +2848,7 @@ class GameClient {
         const maxTargets = typeof options.maxTargets === 'number' ? options.maxTargets : 100;
         const applyTroopsToExisting = options.applyTroopsToExisting !== false;
         const maxDistance = typeof options.maxDistance === 'number' ? options.maxDistance : null;
+        const minDistance = typeof options.minDistance === 'number' ? options.minDistance : 0;
 
         const inactiveSearchUrl = options.inactiveSearchUrl;
         if (!inactiveSearchUrl) throw new Error('FARM_INACTIVESEARCH_URL es obligatorio para usar InactiveSearch.');
@@ -2693,11 +2891,12 @@ class GameClient {
         const sortedCandidates = candidates
             .map(c => ({ ...c, dist: this._distance(center.x, center.y, c.x, c.y) }))
             .filter(c => (maxDistance === null ? true : c.dist <= maxDistance))
+            .filter(c => c.dist >= minDistance)
             .sort((a, b) => a.dist - b.dist);
 
         logger.info(`InactiveSearch: candidatos obtenidos=${candidates.length}, tras filtro/orden=${sortedCandidates.length}, a¤adir=${remaining}`);
         if (maxDistance !== null && sortedCandidates.length < remaining) {
-            logger.warn(`InactiveSearch: no hay suficientes candidatos dentro de dist<=${maxDistance}. Considera subir FARM_MAX_DIST o cambiar la coordenada (c=...) del buscador.`);
+            logger.warn(`InactiveSearch: no hay suficientes candidatos dentro de dist ${minDistance}-${maxDistance}. Considera ajustar FARM_MIN_DIST/FARM_MAX_DIST o cambiar la coordenada (c=...) del buscador.`);
         }
 
         const added = [];
@@ -2754,6 +2953,7 @@ class GameClient {
             added,
             troopCounts,
             maxTargets,
+            minDistance,
             source: 'inactivesearch'
         };
     }
@@ -2765,6 +2965,7 @@ class GameClient {
         const totalTargets = typeof options.totalTargets === 'number' ? options.totalTargets : maxTargetsPerList;
         const applyTroopsToExisting = options.applyTroopsToExisting !== false;
         const maxDistance = typeof options.maxDistance === 'number' ? options.maxDistance : null;
+        const minDistance = typeof options.minDistance === 'number' ? options.minDistance : 0;
         const maxLists = typeof options.maxLists === 'number' ? options.maxLists : 20;
 
         const inactiveSearchUrl = options.inactiveSearchUrl;
@@ -2799,11 +3000,12 @@ class GameClient {
         const sortedCandidates = candidates
             .map(c => ({ ...c, dist: this._distance(center.x, center.y, c.x, c.y) }))
             .filter(c => (maxDistance === null ? true : c.dist <= maxDistance))
+            .filter(c => c.dist >= minDistance)
             .sort((a, b) => a.dist - b.dist);
 
         logger.info(`InactiveSearch: candidatos obtenidos=${candidates.length}, tras filtro/orden=${sortedCandidates.length}, objetivo_total=${wantedTotal}`);
         if (maxDistance !== null && sortedCandidates.length < wantedTotal) {
-            logger.warn(`InactiveSearch: no hay suficientes candidatos dentro de dist<=${maxDistance}. Considera subir FARM_MAX_DIST o cambiar la coordenada (c=...) del buscador.`);
+            logger.warn(`InactiveSearch: no hay suficientes candidatos dentro de dist ${minDistance}-${maxDistance}. Considera ajustar FARM_MIN_DIST/FARM_MAX_DIST o cambiar la coordenada (c=...) del buscador.`);
         }
 
         const globalExistingSet = new Set();
@@ -2811,9 +3013,14 @@ class GameClient {
         const lists = [];
         let cursor = 0;
 
-        for (let listIndex = 1; listIndex <= maxLists && added.length < wantedTotal; listIndex += 1) {
-            const currentListName = this._farmListNameForIndex(listName, listIndex);
-            await this.openFarmList(currentListName, { rallySlot: options.rallySlot, createIfMissing: true });
+        await this._openFarmListTab({ rallySlot: options.rallySlot });
+        const existingNames = await this._getFarmListNamesOnPage();
+        const listEntries = this._buildFarmListSequence(listName, existingNames, maxLists);
+
+        for (const entry of listEntries) {
+            if (added.length >= wantedTotal) break;
+            const currentListName = entry.name;
+            await this.openFarmList(currentListName, { rallySlot: options.rallySlot, createIfMissing: !entry.exists });
 
             if (applyTroopsToExisting) {
                 const changed = await this.setFarmListTroopsForAllTargets(troopCounts);
@@ -2821,7 +3028,6 @@ class GameClient {
             }
 
             const existing = await this.getFarmListTargets();
-            for (const t of existing) globalExistingSet.add(`${t.x}|${t.y}`);
             logger.info(`Objetivos actuales en lista "${currentListName}": ${existing.length}`);
 
             const remainingInList = Math.max(0, maxTargetsPerList - existing.length);
@@ -2892,6 +3098,7 @@ class GameClient {
             troopCounts,
             maxTargetsPerList,
             totalTargets: wantedTotal,
+            minDistance,
             source: 'inactivesearch'
         };
     }

@@ -68,7 +68,7 @@ async function main() {
     const defaultVillageId = normalizeVillageId(initialVillageIdInput);
     console.log(`Usando aldea: ${defaultVillageId}`);
 
-    await showCurrentTasks(account.id);
+    await showCurrentTasks(account.id, defaultVillageId);
 
     while (true) {
         console.log('\n¿Qué quieres hacer?\n');
@@ -88,7 +88,7 @@ async function main() {
                 await addBuildingTask(account.id, account.village_scan, defaultVillageId);
                 break;
             case '3':
-                await showCurrentTasks(account.id);
+                await showCurrentTasks(account.id, defaultVillageId);
                 break;
             case '4':
                 await clearTasks(account.id);
@@ -243,19 +243,27 @@ async function addBuildingTask(accountId, villageScan, villageId) {
     }
 }
 
-async function showCurrentTasks(accountId) {
-    const { data: tasks } = await supabase
+async function showCurrentTasks(accountId, villageId) {
+    const targetVillageId = normalizeVillageId(villageId);
+    let query = supabase
         .from('build_queue')
         .select('*')
         .eq('account_id', accountId)
-        .eq('status', 'pending')
-        .order('priority', { ascending: false });
+        .eq('status', 'pending');
 
-    console.log('\n📋 TAREAS PENDIENTES:');
+    if (targetVillageId === 'main') {
+        query = query.or('village_id.is.null,village_id.eq.main');
+    } else {
+        query = query.eq('village_id', targetVillageId);
+    }
+
+    const { data: tasks } = await query.order('priority', { ascending: false });
+
+    console.log(`\nTAREAS PENDIENTES (aldea: ${targetVillageId}):`);
     if (!tasks || tasks.length === 0) console.log('   (Ninguna)');
     else {
         tasks.forEach((t, i) => {
-            console.log(`   ${i+1}. ${t.building_name} → Nivel ${t.target_level}`);
+            console.log(`   ${i+1}. ${t.building_name} -> Nivel ${t.target_level}`);
         });
     }
 }
