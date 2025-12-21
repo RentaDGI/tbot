@@ -366,12 +366,19 @@ class TaskRunner {
                             ? nonResource.target_level
                             : null;
                         let currentLevel = null;
+                        let activeSlot = targetSlot || null;
 
                         if (targetSlot) {
                             await this.client.clickBuildingSlot(targetSlot);
                         } else if (nonResource.building_name) {
                             const slot = await this.client.findBuildingSlot(nonResource.building_name);
-                            if (slot) await this.client.clickBuildingSlot(slot);
+                            if (slot) {
+                                activeSlot = slot;
+                                await this.client.clickBuildingSlot(slot);
+                            } else {
+                                logger.warn('No se pudo localizar el edificio "' + nonResource.building_name + '".');
+                                continue;
+                            }
                         }
 
                         try {
@@ -388,6 +395,19 @@ class TaskRunner {
 
                                 const buildNew = await this.client.constructBuildingFromEmptySlot(nameForBuild);
                                 if (buildNew && buildNew.success) {
+                                    const verify = activeSlot
+                                        ? await this.client.verifyBuildingQueued({ slot: activeSlot, buildingName: nameForBuild })
+                                        : null;
+                                    if (!verify || !verify.ok) {
+                                        const reason = (verify && verify.reason) || 'building_not_queued';
+                                        logger.warn('Construccion no reflejada en cola (motivo: ' + reason + ').');
+                                        if (verify && verify.queueText && verify.queueText.length) {
+                                            logger.info('Contenido de cola detectado: ' + verify.queueText.join(' | '));
+                                        }
+                                        if (nonResource.id) await failBuildTask(nonResource.id, `No se reflejo en cola: ${reason}`, 'failed');
+                                        return { success: false, reason };
+                                    }
+
                                     const nextLevel = 1;
                                     const willReachTarget = targetLevel !== null && nextLevel >= targetLevel;
 
@@ -434,6 +454,18 @@ class TaskRunner {
 
                         const upgradeResult = await this.client.upgradeBuild();
                         if (upgradeResult.success) {
+                            const verify = activeSlot
+                                ? await this.client.verifyBuildingQueued({ slot: activeSlot, buildingName: nonResource.building_name })
+                                : null;
+                            if (!verify || !verify.ok) {
+                                const reason = (verify && verify.reason) || 'building_not_queued';
+                                logger.warn('Construccion no reflejada en cola (motivo: ' + reason + ').');
+                                if (verify && verify.queueText && verify.queueText.length) {
+                                    logger.info('Contenido de cola detectado: ' + verify.queueText.join(' | '));
+                                }
+                                return { success: false, reason };
+                            }
+
                             const nextLevel = currentLevel !== null ? currentLevel + 1 : null;
                             const willReachTarget = targetLevel !== null &&
                                 nextLevel !== null &&
@@ -488,6 +520,19 @@ class TaskRunner {
             const upgradeResult = await this.client.upgradeBuild();
 
             if (upgradeResult.success) {
+                const verify = await this.client.verifyBuildingQueued({
+                    slot: lowestField.slot,
+                    buildingName: lowestField.task.building_name
+                });
+                if (!verify || !verify.ok) {
+                    const reason = (verify && verify.reason) || 'building_not_queued';
+                    logger.warn('Construccion no reflejada en cola (motivo: ' + reason + ').');
+                    if (verify && verify.queueText && verify.queueText.length) {
+                        logger.info('Contenido de cola detectado: ' + verify.queueText.join(' | '));
+                    }
+                    return { success: false, reason };
+                }
+
                 logger.success('Construccion: ' + lowestField.task.building_name + ' (Slot ' + lowestField.slot + ': ' + lowestField.level + ' -> ' + (lowestField.level + 1) + ')');
                 this.client.updateFieldLevel(lowestField.slot, true);
                 return { success: true };

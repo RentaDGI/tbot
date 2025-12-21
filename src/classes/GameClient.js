@@ -915,6 +915,81 @@ class GameClient {
         return { success: false, reason: result.reason };
     }
 
+    async verifyBuildingQueued({ slot, buildingName } = {}) {
+        if (this.page.isClosed()) return { ok: false, reason: 'browser_closed' };
+        return await this.page.evaluate(({ slot, buildingName }) => {
+            const normalize = (text) => (text || '')
+                .toLowerCase()
+                .normalize('NFD')
+                .replace(/[\u0300-\u036f]/g, '')
+                .trim();
+
+            const errorEl = document.querySelector('.error, .alert, .warning, .messageError');
+            if (errorEl) {
+                const errText = normalize(errorEl.innerText);
+                if (errText.includes('cola') && errText.includes('llena')) return { ok: false, reason: 'queue_full', message: errText };
+                if (errText.includes('recurs') || errText.includes('resource') || errText.includes('madera') || errText.includes('barro') || errText.includes('arcilla')) {
+                    return { ok: false, reason: 'not_enough_resources', message: errText };
+                }
+            }
+
+            if (document.querySelector('.queueFull, .buildingQueueFull')) return { ok: false, reason: 'queue_full' };
+
+            const queueSelectors = [
+                '.under_progress', '.under-progress', '.productionQueue', '.queue',
+                '.underConstruction', '.build_queue', '.buildingList .under_progress',
+                '.boxes-contents .under_progress', '.boxes-contents .under-progress',
+                '.buildingList', '.buildDetails', '.queueWrapper'
+            ];
+
+            const queueEntries = Array.from(document.querySelectorAll(queueSelectors.join(',')));
+
+            const targetName = normalize(buildingName);
+            const stop = new Set(['de', 'del', 'la', 'el', 'los', 'las', 'und', 'der', 'die', 'das', 'a', 'to']);
+            const tokens = targetName
+                ? targetName.split(' ').map(t => t.trim()).filter(t => t && !stop.has(t) && t.length >= 4)
+                : [];
+
+            const matchesByTokens = (text) => {
+                if (!tokens.length) return false;
+                const matched = tokens.filter(t => text.includes(t)).length;
+                return matched === tokens.length || (matched >= 1 && /\d{1,2}:\d{2}/.test(text));
+            };
+
+            const matchesEntry = (node) => {
+                const text = normalize(node.innerText || '');
+                if (!text) return false;
+
+                if (typeof slot === 'number') {
+                    const links = Array.from(node.querySelectorAll('a[href*="build.php?id="]'));
+                    const hit = links.some(link => {
+                        const href = link.getAttribute('href') || '';
+                        const match = href.match(/id=(\d+)/);
+                        return match && parseInt(match[1], 10) === slot;
+                    });
+                    if (hit) return true;
+                }
+
+                if (targetName && text.includes(targetName)) return true;
+                if (targetName && matchesByTokens(text)) return true;
+
+                const imgs = Array.from(node.querySelectorAll('img'));
+                if (targetName && imgs.some(img => {
+                    const alt = normalize(img.getAttribute('alt') || '');
+                    const title = normalize(img.getAttribute('title') || '');
+                    return alt.includes(targetName) || title.includes(targetName);
+                })) return true;
+
+                return false;
+            };
+
+            if (queueEntries.some(matchesEntry)) return { ok: true };
+
+            const queueText = queueEntries.map(n => normalize(n.innerText || '')).filter(Boolean).slice(0, 4);
+            return { ok: false, reason: 'building_not_queued', queueText };
+        }, { slot, buildingName }).catch(() => null);
+    }
+
     async constructBuildingFromEmptySlot(buildingName) {
         if (this.page.isClosed()) return { success: false, reason: 'browser_closed' };
         const wanted = this._normalizeText(buildingName);
