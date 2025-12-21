@@ -11,14 +11,16 @@ const BUILDING_KEYWORDS = {
     stable: ['establo', 'estable', 'stable'],
     workshop: ['taller', 'taller de asedio', 'workshop'],
     residence: ['residencia', 'palacio', 'residence', 'palace'],
-    rallyPoint: ['plaza de reuniones', 'plaza de reunion', 'rally point', 'assembly point']
+    rallyPoint: ['plaza de reuniones', 'plaza de reunion', 'rally point', 'assembly point'],
+    townHall: ['ayuntamiento', 'town hall', 'townhall', 'town-hall']
 };
 const BUILDING_GIDS = {
     barracks: [19],
     stable: [20],
     workshop: [21],
     residence: [25, 26],
-    rallyPoint: [16]
+    rallyPoint: [16],
+    townHall: [24]
 };
 
 class GameClient {
@@ -827,6 +829,97 @@ class GameClient {
         });
     }
 
+    async startTownHallParty(options = {}) {
+        if (this.page.isClosed()) return { success: false, reason: 'browser_closed' };
+
+        const partyType = (options.partyType || 'small').toString().toLowerCase().trim();
+        const townHallSlot = options.townHallSlot;
+        const slot = await this.findBuildingSlot('townHall', townHallSlot);
+        if (!slot) return { success: false, reason: 'building_not_found' };
+
+        await this.page.goto(`${process.env.GAME_URL}/build.php?id=${slot}`, { waitUntil: 'domcontentloaded' });
+        await humanDelay(this.page, 1200, 1800);
+
+        const result = await this.page.evaluate((partyType) => {
+            const normalize = (text) => (text || '')
+                .toLowerCase()
+                .normalize('NFD')
+                .replace(/[\u0300-\u036f]/g, '')
+                .replace(/\s+/g, ' ')
+                .trim();
+
+            const bodyText = normalize(document.body ? document.body.innerText : '');
+            const runningMarkers = [
+                'fiesta en curso',
+                'fiesta en progreso',
+                'celebracion en curso',
+                'celebracion en progreso',
+                'celebration in progress',
+                'party in progress',
+                'celebration running'
+            ];
+            if (runningMarkers.some(marker => bodyText.includes(marker))) {
+                return { success: false, reason: 'already_running' };
+            }
+
+            const buttonKeywords = ['organizar', 'celebrar', 'celebration', 'celebrate', 'start'];
+            const blacklist = ['cancelar', 'cerrar', 'close', 'plus', 'premium'];
+            const buttons = Array.from(document.querySelectorAll('button, input[type="submit"], a, [role="button"]'));
+            const wantLarge = partyType === 'large';
+
+            const matchesType = (text) => {
+                if (!text) return false;
+                const hasSmall = text.includes('peque') || text.includes('small');
+                const hasLarge = text.includes('grande') || text.includes('gran') || text.includes('large');
+                return wantLarge ? (hasLarge && !hasSmall) : (hasSmall && !hasLarge);
+            };
+
+            const getContextText = (btn) => {
+                let node = btn;
+                let combined = '';
+                for (let i = 0; i < 5 && node; i += 1) {
+                    if (node.innerText) combined += ` ${node.innerText}`;
+                    node = node.parentElement;
+                }
+                return normalize(combined);
+            };
+
+            const scored = [];
+            for (const btn of buttons) {
+                const text = normalize(btn.innerText || btn.value || '');
+                if (!text) continue;
+                if (buttonKeywords.every(k => !text.includes(k))) continue;
+                if (blacklist.some(k => text.includes(k))) continue;
+
+                const contextText = getContextText(btn);
+                const hasPartyWord = contextText.includes('fiesta') || contextText.includes('celebr');
+                const typeMatch = matchesType(contextText);
+                scored.push({ btn, hasPartyWord, typeMatch });
+            }
+
+            if (!scored.length) return { success: false, reason: 'button_not_found' };
+
+            const chosen = scored.find(s => s.typeMatch) ||
+                scored.find(s => s.hasPartyWord) ||
+                scored[0];
+
+            const el = chosen.btn;
+            const classes = normalize(el.className || '');
+            const isDisabled = !!el.disabled || classes.includes('disabled') || classes.includes('grey');
+            if (isDisabled) return { success: false, reason: 'disabled' };
+
+            el.click();
+            return { success: true };
+        }, partyType);
+
+        if (result && result.success) {
+            await humanDelay(this.page, 1500, 2200);
+            return { success: true };
+        }
+
+        return result || { success: false, reason: 'unknown' };
+    }
+
     async upgradeBuild() {
         if (this.page.isClosed()) return { success: false, reason: 'browser_closed' };
         
@@ -910,9 +1003,58 @@ class GameClient {
             } else {
                 await humanDelay(this.page, 2000, 3000);
             }
+            const confirmed = await this.confirmBuildIfNeeded();
+            if (confirmed) {
+                await humanDelay(this.page, 1200, 2000);
+            }
             return { success: true };
         }
         return { success: false, reason: result.reason };
+    }
+
+    async confirmBuildIfNeeded() {
+        if (this.page.isClosed()) return false;
+        const clicked = await this.page.evaluate(() => {
+            const normalize = (text) => (text || '')
+                .toLowerCase()
+                .normalize('NFD')
+                .replace(/[\u0300-\u036f]/g, '')
+                .trim();
+
+            const confirmWords = ['confirmar', 'confirm', 'aceptar', 'ok', 'si', 'yes', 'construir', 'mejorar', 'ampliar', 'build', 'upgrade'];
+            const cancelWords = ['cancelar', 'cancel', 'cerrar', 'close', 'abbrechen', 'nein', 'no'];
+            const containers = [
+                '.dialog', '.modal', '.overlay', '.popup', '.popupDialog', '.ui-dialog', '.msgBox',
+                '#dialog', '#dialogBox', '.dialogBox', '.buildDialog', '.confirmation', '.confirm'
+            ];
+
+            const roots = [];
+            for (const sel of containers) {
+                const nodes = Array.from(document.querySelectorAll(sel));
+                for (const node of nodes) roots.push(node);
+            }
+
+            if (!roots.length) return false;
+
+            const collect = (root) => Array.from(root.querySelectorAll('button, input[type="submit"], a, [role="button"]'));
+
+            for (const root of roots) {
+                const buttons = collect(root);
+                for (const btn of buttons) {
+                    const text = normalize(btn.innerText || btn.value || '');
+                    const classes = normalize(btn.className || '');
+                    if (!text && !classes) continue;
+                    if (btn.disabled || classes.includes('disabled')) continue;
+                    if (cancelWords.some(word => text.includes(word))) continue;
+                    if (!confirmWords.some(word => text.includes(word)) && !classes.includes('confirm')) continue;
+                    btn.click();
+                    return true;
+                }
+            }
+            return false;
+        });
+
+        return !!clicked;
     }
 
     async verifyBuildingQueued({ slot, buildingName } = {}) {

@@ -25,6 +25,7 @@ class TaskRunner {
         this.lastOasisRaid = 0;
         this.nextFarmListRunAt = 0;
         this.lastBuildVillageId = null;
+        this.nextPartyCheckAt = 0;
     }
 
     getFarmListIntervalMs() {
@@ -90,8 +91,11 @@ class TaskRunner {
                 // Revisa aventuras en cada ciclo (sin filtrar por salud)
                 await this.client.checkAndStartAdventure();
 
-                // Lanzar listas de vacas con intervalo aleatorio (20-40 min)
+                // Lanzar listas de vacas con intervalo aleatorio (20-40 min)   
                 await this.maybeLaunchFarmLists();
+
+                // Revisar fiestas en ayuntamiento
+                await this.maybeStartTownHallParty();
 
                 if (this.cycleCount % 50 === 0) {
                     logger.info('Re-escaneo periodico...');
@@ -267,6 +271,62 @@ class TaskRunner {
             logger.warn('Error lanzando listas de vacas: ' + error.message);
             // Reintentar pronto si hubo un fallo de UI/navegacion
             this.nextFarmListRunAt = Date.now() + randomInterval(2 * 60 * 1000, 5 * 60 * 1000);
+        }
+    }
+
+    getPartyIntervalMs() {
+        const minutes = parseInt(process.env.PARTY_CHECK_MINUTES || '5', 10);
+        if (Number.isNaN(minutes) || minutes <= 0) return 5 * 60 * 1000;
+        return minutes * 60 * 1000;
+    }
+
+    async maybeStartTownHallParty() {
+        const villageTarget = (process.env.PARTY_VILLAGE_ID || '').toString().trim();
+        if (!villageTarget) return;
+
+        const now = Date.now();
+        if (this.nextPartyCheckAt && now < this.nextPartyCheckAt) return;
+        this.nextPartyCheckAt = now + this.getPartyIntervalMs();
+
+        const partyType = (process.env.PARTY_TYPE || 'small').toString().trim().toLowerCase();
+        const slotRaw = (process.env.PARTY_TOWNHALL_SLOT || '').toString().trim();
+        const townHallSlot = slotRaw ? parseInt(slotRaw, 10) : undefined;
+
+        if (slotRaw && Number.isNaN(townHallSlot)) {
+            logger.warn('PARTY_TOWNHALL_SLOT invalido. Debe ser un numero.');
+        }
+
+        try {
+            const switched = await this.client.switchToVillage(villageTarget);
+            if (!switched) {
+                logger.warn('No se pudo cambiar a la aldea para fiestas: ' + villageTarget);
+                return;
+            }
+
+            const result = await this.client.startTownHallParty({
+                partyType,
+                townHallSlot: Number.isNaN(townHallSlot) ? undefined : townHallSlot
+            });
+
+            if (result && result.success) {
+                logger.success('Fiesta iniciada en ayuntamiento.');
+                return;
+            }
+
+            const reason = (result && result.reason) || 'unknown';
+            if (reason === 'already_running') {
+                logger.info('Ayuntamiento: ya hay una fiesta en curso.');
+            } else if (reason === 'disabled') {
+                logger.info('Ayuntamiento: fiesta no disponible (recursos o bloqueo).');
+            } else if (reason === 'building_not_found') {
+                logger.warn('Ayuntamiento no encontrado para iniciar fiesta.');
+            } else if (reason === 'button_not_found') {
+                logger.warn('No se encontro el boton de organizar fiesta.');
+            } else {
+                logger.warn('No se pudo iniciar fiesta: ' + reason);
+            }
+        } catch (error) {
+            logger.warn('Error al iniciar fiesta: ' + error.message);
         }
     }
 
